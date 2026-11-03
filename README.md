@@ -43,7 +43,7 @@ Android 上运行的本地 AI 模型聚合网关：把多家私有 AI 服务账�
 
 ## 快速开始
 
-1. 到 [Releases](https://github.com/xibai6668/Android-AI-gateway/releases) 下载最新的 `ai-gateway-<版本>-release.apk` 安装。
+1. 到 [Releases](https://github.com/ding999306-max/Android-AI-gateway/releases) 下载最新的 `ai-gateway-<版本>-release.apk` 安装。
 2. 打开 App，首页点「启动网关服务」；首页显示「运行中」即表示端口已在监听。
 3. 到「供应商」页登录要用的账号（Trae / WorkBuddy / Antigravity / Loomy / 小浣熊），或添加自定义 OpenAI 兼容中转站。
 4. 客户端里填接入信息：
