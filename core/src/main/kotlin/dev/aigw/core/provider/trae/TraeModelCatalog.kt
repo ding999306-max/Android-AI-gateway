@@ -11,9 +11,11 @@ class TraeModelCatalog(
     private val client: TraeChatClient,
     private val nowMillis: () -> Long = System::currentTimeMillis,
 ) {
-    private var cached: List<TraeModel>? = null
-    private var fetchedAt = 0L
-    private var lastFailureAt = 0L
+    // 缓存字段同时在「模型页拉清单」和「请求路径软校验」两个线程上下文里读写，
+    // 用 @Volatile 保证可见性（cachedIds 的读不能只靠 models 侧自己加锁）。
+    @Volatile private var cached: List<TraeModel>? = null
+    @Volatile private var fetchedAt = 0L
+    @Volatile private var lastFailureAt = 0L
 
     /** 本次返回的清单是否不是来自本次成功实时拉取（即用了旧缓存或拉取失败）。 */
     var fromFallback: Boolean = false
@@ -68,6 +70,21 @@ class TraeModelCatalog(
         }
     }
 
+    /**
+     * 可信缓存里的模型 id 集合；没有可信缓存（未拉取 / 已过期 / 最近失败）时返回 null。
+     *
+     * 只读缓存、不触发网络，供请求路径做轻量校验。宁可返回 null 放行，也不要为了
+     * 「校验」在请求链路上多打一次上游。
+     */
+    @Synchronized
+    fun cachedIds(): Set<String>? {
+        val list = cached ?: return null
+        val now = nowMillis()
+        if (now - fetchedAt >= TTL_MILLIS) return null
+        if (lastFailureAt != 0L && now - lastFailureAt < FAIL_TTL_MILLIS) return null
+        return list.map { it.id }.toSet()
+    }
+
     /** 强制下次重新拉取（界面的刷新按钮用）。 */
     fun invalidate() {
         fetchedAt = 0L
@@ -85,6 +102,13 @@ class TraeModelCatalog(
             "explore_sub_agent_v2",
             "explore_sub_agent_v13",
             "custom_model_placeholder",
+            // 以下四项出现在 solo_work_lite 的 config_info_list 里，但实测逐个调用一律
+            // 4001「param is invalid」—— 它们是上游的内部功能条目，不是对话模型。
+            // 不隐藏就会在模型列表里露出几个点了必报错的假选项。
+            "fast_apply",
+            "input_optimization",
+            "title_generation",
+            "laziness_detection",
         )
 
         fun isInternal(id: String): Boolean = id in INTERNAL_IDS

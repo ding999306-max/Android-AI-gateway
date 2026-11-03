@@ -2,6 +2,7 @@ package dev.aigw.core.provider.custom
 
 import com.sun.net.httpserver.HttpServer
 import dev.aigw.core.gateway.CustomProviderConfig
+import dev.aigw.core.provider.ErrorKind
 import dev.aigw.core.provider.ProviderAccount
 import java.net.InetSocketAddress
 import kotlin.test.Test
@@ -126,6 +127,42 @@ class CustomProviderEmptyResponseTest {
             )
             assertNull(call.failure, "只有工具调用也是有效回复")
             assertEquals(body, call.aggregated)
+        }
+    }
+    @Test
+    fun `403 归为客户端错误而不是凭证失效`() {
+        // 第三方端点用 403 表示「这个 key 无权访问该模型」很常见；归 SESSION_DEAD 会让
+        // 网关把整条账号硬禁用（AccountPool.disable），换模型试一次就得手动重新启用。
+        val error = provider("http://127.0.0.1:1/v1")
+            .classify(403, """{"error":{"message":"no access to model"}}""")
+        assertEquals(ErrorKind.CLIENT, error.kind)
+        assertTrue(error.message.contains("no access"), "应保留上游原话：${error.message}")
+    }
+
+    @Test
+    fun `Content-Type 标成 text-plain 的 SSE 在流式请求下仍然透传`() {
+        val sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+        withUpstream(contentType = "text/plain", body = sse) { baseUrl ->
+            val call = provider(baseUrl).openChat(
+                account(),
+                """{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}""",
+            )
+            assertNotNull(call.stream, "应识别为 SSE 并透传，而不是读全文后报错")
+            assertTrue(call.stream!!.bufferedReader().readText().contains("data: [DONE]"))
+            call.close()
+        }
+    }
+
+    @Test
+    fun `Content-Type 标错的 SSE 在非流式请求下也能聚合`() {
+        val sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+        withUpstream(contentType = "text/plain", body = sse) { baseUrl ->
+            val call = provider(baseUrl).openChat(
+                account(),
+                """{"model":"m","messages":[{"role":"user","content":"hi"}]}""",
+            )
+            assertNull(call.failure)
+            assertTrue(call.aggregated!!.contains("hi"))
         }
     }
 }

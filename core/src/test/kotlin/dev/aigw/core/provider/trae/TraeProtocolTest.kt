@@ -19,6 +19,8 @@ class TraePayloadTest {
     fun `强制流式并写入 function 与 config_name`() {
         val out = prepare("""{"model":"glm-5.2","stream":false,"messages":[]}""")
         assertEquals(true, out.get("stream").asBoolean)
+        // 4001 的根因是 config_name 不在该 function 的 config_info_list 里，
+        // 不是 function 本身无效 —— 见 TraeConstants.FUNCTION 注释。
         assertEquals("solo_work_lite", out.get("function").asString)
         assertEquals("glm-5.2", out.get("config_name").asString)
         assertEquals("glm-5.2", out.get("model").asString)
@@ -27,7 +29,8 @@ class TraePayloadTest {
     @Test
     fun `model 为空时用默认模型`() {
         val out = prepare("""{"messages":[]}""")
-        assertEquals("glm-5.2", out.get("config_name").asString)
+        // 旧值 glm-5.2 不在 solo_work_lite 的清单里（只在 solo_agent 里），这才是原始故障
+        assertEquals("gpt-5.2", out.get("config_name").asString)
     }
 
     @Test
@@ -261,6 +264,35 @@ class OpenAiSseTranslatorTest {
     }
 
     @Test
+    fun `contentChars 只统计正文和思维链，不含 SSE 包装`() {
+        val translator = OpenAiSseTranslator("id1", "m")
+        translator.translate(SoloEvent.Output("你好", "思考", null))
+        translator.translate(SoloEvent.Output("世界", "", null))
+        // 2+2 + 2 = 6；若按整条 SSE 帧计，这里会是几百
+        assertEquals(6L, translator.contentChars)
+    }
+
+    @Test
+    fun `长度截断补 finish_reason=length 的收尾帧`() {
+        val translator = OpenAiSseTranslator("id1", "m")
+        translator.translate(SoloEvent.Output("很长的一段内容", "", null))
+        val tail = translator.truncate()
+        assertEquals(2, tail.size, "收尾帧 + DONE")
+        val chunk = JsonParser.parseString(tail[0].removePrefix("data: ").trim()).asJsonObject
+        val choice = chunk.getAsJsonArray("choices")[0].asJsonObject
+        assertEquals("length", choice.get("finish_reason").asString, "必须告诉客户端是被截断的")
+        assertEquals("data: [DONE]\n\n", tail[1])
+        assertTrue(translator.close().isEmpty(), "truncate 之后不应再补 DONE")
+    }
+
+    @Test
+    fun `已经写过 done 时 truncate 不再发帧`() {
+        val translator = OpenAiSseTranslator("id1", "m")
+        translator.translate(SoloEvent.Done("stop"))
+        assertTrue(translator.truncate().isEmpty())
+    }
+
+    @Test
     fun `流内错误输出 OpenAI 标准错误帧`() {
         // 额度/权益不足（code 1005）曾被转成私有格式（event: error + 字符串 body），
         // 网关的 parseChunk 识别不了，客户端看到的是「正常结束」——错误被静默吞掉
@@ -313,6 +345,16 @@ class OpenAiAggregatorTest {
         assertEquals(2, out.getAsJsonObject("usage").get("completion_tokens").asInt)
         assertEquals("stop", out.getAsJsonArray("choices")[0].asJsonObject.get("finish_reason").asString)
         assertNull(aggregator.failure)
+    }
+
+    @Test
+    fun `内容计数与截断标记`() {
+        val aggregator = OpenAiAggregator("id1", "m")
+        aggregator.accept(SoloEvent.Output("Hello", "想", null))
+        assertEquals(6L, aggregator.contentChars)
+        aggregator.markTruncated()
+        val out = aggregator.build()
+        assertEquals("length", out.getAsJsonArray("choices")[0].asJsonObject.get("finish_reason").asString)
     }
 
     @Test
@@ -555,5 +597,25 @@ class TraeAuthClientTest {
         assertEquals(1786847930L, TraeAuthClient.expiresAtOf(1786847930141L, 0, 0))
         assertEquals(200L, TraeAuthClient.expiresAtOf(0, 100, 100))
         assertEquals(0L, TraeAuthClient.expiresAtOf(0, 0, 0))
+    }
+}
+
+class TraeCodeExtractTest {
+
+    @Test
+    fun `纯 JSON 与混合文本都能取出业务码`() {
+        assertEquals(4001L, TraeErrors.extractCode("""{"code":4001,"message":"param is invalid"}"""))
+        assertEquals(4001L, TraeErrors.extractCodeLenient("""{"code":4001}"""))
+        // 真实形态：TraeChatClient 给错误体包了一层诊断前缀，不再是合法 JSON
+        val wrapped = """上游未返回 SSE 流（Content-Type: application/json）：{"code":4001,"message":"param is invalid"}"""
+        assertEquals(0L, TraeErrors.extractCode(wrapped), "整段解析必然失败")
+        assertEquals(4001L, TraeErrors.extractCodeLenient(wrapped))
+        assertEquals(0L, TraeErrors.extractCodeLenient("nothing here"))
+    }
+
+    @Test
+    fun `包了诊断前缀的 4001 仍归为客户端错误`() {
+        val wrapped = """上游未返回 SSE 流（Content-Type: application/json）：{"code":4001}"""
+        assertEquals(TraeErrorKind.CLIENT, TraeErrors.fromStatus(400, wrapped))
     }
 }

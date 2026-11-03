@@ -22,6 +22,7 @@ import dev.aigw.core.util.HttpSupport
 import dev.aigw.core.util.arrayOrNull
 import dev.aigw.core.util.bodySnippet
 import dev.aigw.core.util.objOrNull
+import java.io.PushbackInputStream
 import java.net.HttpURLConnection
 
 /**
@@ -84,23 +85,27 @@ class CustomProvider(
         }
 
         val contentType = conn.contentType.orEmpty()
-        val stream = conn.inputStream
         if (contentType.contains("event-stream", ignoreCase = true)) {
-            if (streaming) {
-                return StreamingChatCall(status, stream) { conn.disconnect() }
-            }
-            val aggregated = try {
-                OpenAiSseAggregator.aggregate(stream, model)
-            } finally {
-                conn.disconnect()
-            }
-            if (OpenAiSseAggregator.isEmptyCompletion(aggregated)) {
-                return emptyUpstreamFailure(status, contentType, aggregated)
-            }
-            return AggregatedChatCall(status, aggregated)
+            return eventStreamCall(conn.inputStream, conn, status, streaming, model)
         }
 
-        val text = runCatching { stream.use { HttpSupport.readLimited(it) } }.getOrDefault("")
+        // 非 event-stream：可能是 JSON，也可能是 Content-Type 标错/缺失的 SSE——不少中转站
+        // 会把 SSE 标成 text/plain。先窥探开头一小段再决定，避免把一条 SSE 流整个读进
+        // 内存（1MB 上限）之后才报「不符合 OpenAI 协议」，客户端白等几十秒。
+        val probe = PushbackInputStream(conn.inputStream, PROBE_BYTES)
+        val head = ByteArray(PROBE_BYTES)
+        var headLen = 0
+        while (headLen < PROBE_BYTES) {
+            val n = runCatching { probe.read(head, headLen, PROBE_BYTES - headLen) }.getOrDefault(-1)
+            if (n <= 0) break
+            headLen += n
+        }
+        if (headLen > 0) probe.unread(head, 0, headLen)
+        if (headLen > 0 && looksLikeSse(String(head, 0, headLen, Charsets.UTF_8))) {
+            return eventStreamCall(probe, conn, status, streaming, model)
+        }
+
+        val text = runCatching { probe.use { HttpSupport.readLimited(it) } }.getOrDefault("")
         conn.disconnect()
         // 200 但空 body（代理吞响应、上游静默拒绝）：当成功会让客户端「输出完成却什么都没有」
         if (text.isBlank()) return emptyUpstreamFailure(status, contentType, text)
@@ -119,6 +124,39 @@ class CustomProvider(
             return StreamingChatCall(status, OpenAiSseAggregator.completionAsSse(text).byteInputStream(Charsets.UTF_8))
         }
         return AggregatedChatCall(status, text)
+    }
+
+    /** 把上游 SSE 原样透传（客户端要流式）或聚合（客户端要非流式）。 */
+    private fun eventStreamCall(
+        stream: java.io.InputStream,
+        conn: HttpURLConnection,
+        status: Int,
+        streaming: Boolean,
+        model: String,
+    ): ChatCall {
+        if (streaming) {
+            return StreamingChatCall(status, stream) { conn.disconnect() }
+        }
+        val aggregated = try {
+            OpenAiSseAggregator.aggregate(stream, model)
+        } finally {
+            conn.disconnect()
+        }
+        if (OpenAiSseAggregator.isEmptyCompletion(aggregated)) {
+            return emptyUpstreamFailure(status, conn.contentType.orEmpty(), aggregated)
+        }
+        return AggregatedChatCall(status, aggregated)
+    }
+
+    /**
+     * 开头是否像 SSE：`data:` / `event:` / `id:` / 注释行（`:`）都算。
+     * 正常的 OpenAI JSON 响应以 `{` 开头，不会命中。
+     */
+    private fun looksLikeSse(head: String): Boolean {
+        val text = head.removePrefix("\uFEFF").trimStart()
+        if (text.isEmpty()) return false
+        return text.startsWith("data:") || text.startsWith("event:") ||
+            text.startsWith("id:") || text.startsWith(":")
     }
 
     /** 上游 200 但没给出任何内容：保持可检测的失败，不能报成「成功的空回复」。 */
@@ -140,7 +178,11 @@ class CustomProvider(
     override fun classify(status: Int, body: String): UpstreamError {
         val message = extractMessage(body).ifEmpty { "上游 HTTP $status" + bodySnippet(body) }
         val kind = when {
-            status == 401 || status == 403 -> ErrorKind.SESSION_DEAD
+            status == 401 -> ErrorKind.SESSION_DEAD
+            // 403 在第三方 OpenAI 兼容端点上通常是「该 key 无权访问这个模型」/区域限制，
+            // 不是凭证失效。归 SESSION_DEAD 会触发 AccountPool.disable 把整条账号硬禁用，
+            // 换个模型试一下就得手动去重新启用——按客户端错误直接报给用户看。
+            status == 403 -> ErrorKind.CLIENT
             status == 402 -> ErrorKind.QUOTA
             status == 404 -> ErrorKind.NOT_FOUND
             status == 429 -> ErrorKind.SOFT_RATE
@@ -270,5 +312,8 @@ class CustomProvider(
 
         private const val CONNECT_TIMEOUT_MS = 30_000
         private const val READ_TIMEOUT_MS = 300_000
+
+        /** 判断响应体是不是被标错 Content-Type 的 SSE 时，窥探的字节数。 */
+        private const val PROBE_BYTES = 256
     }
 }

@@ -109,7 +109,7 @@ object TraeErrors {
 
     /** 按 HTTP 状态码 + 响应体里的业务 code 判断错误类别。 */
     fun fromStatus(status: Int, body: String): TraeErrorKind {
-        val code = extractCode(body)
+        val code = extractCodeLenient(body)
         return when {
             status == 401 -> TraeErrorKind.SESSION_DEAD
             status == 404 -> TraeErrorKind.NOT_FOUND
@@ -133,6 +133,18 @@ object TraeErrors {
         val direct = obj.long("code")
         if (direct != 0L) return direct
         return obj.objOrNull("data")?.long("code") ?: 0L
+    }
+
+    /**
+     * 宽松版：整段是 JSON 时等价于 [extractCode]；不是 JSON（例如被诊断文案包了一层的
+     * `上游未返回 SSE 流（…）：{"code":4001}`）时，退而匹配其中的 `"code":123` 片段。
+     * 请求路径要用这个——否则 200 + 业务错误体会被当成未知错误，丢掉 CLIENT 分类。
+     */
+    fun extractCodeLenient(body: String): Long {
+        if (body.isEmpty()) return 0L
+        extractCode(body).takeIf { it != 0L }?.let { return it }
+        return Regex("\"code\"\\s*:\\s*(\\d+)").find(body)
+            ?.groupValues?.get(1)?.toLongOrNull() ?: 0L
     }
 
     /** 从响应体里取可读的错误消息。 */
