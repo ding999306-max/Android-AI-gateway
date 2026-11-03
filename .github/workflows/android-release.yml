@@ -4,6 +4,8 @@ name: Android Release
 # 本地开发一律走 debug 包（见 scripts/build.sh 与 app/build.gradle.kts 的 buildTypes.debug）。
 on:
   workflow_dispatch:
+  # 供 upstream-sync.yml 在上游发版后复用同一套发版流程
+  workflow_call:
 
 permissions:
   contents: write
@@ -16,6 +18,8 @@ jobs:
         with:
           # 生成 Release 说明需要上一个 tag 到本次的完整历史
           fetch-depth: 0
+          # 被 upstream-sync 调用时，构建刚合并并推送的 main 顶端
+          ref: main
 
       - uses: actions/setup-java@v5
         with:
@@ -68,7 +72,7 @@ jobs:
           PREV_TAG=$(git tag --sort=-v:refname | grep -v "^v${{ steps.version.outputs.version }}$" | head -n1)
           RANGE="HEAD"
           [ -n "$PREV_TAG" ] && RANGE="$PREV_TAG..HEAD"
-          LOG=$(git log $RANGE --no-merges --pretty='- %s' -- app core)
+          LOG=$(git log $RANGE --no-merges --pretty='- %s' -- app core | head -40)
           [ -n "$LOG" ] || LOG="- 无应用相关变化"
           {
             echo "body<<CHANGELOG_EOF"

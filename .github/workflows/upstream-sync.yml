@@ -1,0 +1,106 @@
+name: Sync Upstream Release
+
+# 以上游「正式 Release」为同步基准（不是 main 的每次提交）：
+#   上游发新 Release → 合并该 tag → 跑测试 → 自动构建并发布自己的 Release。
+# 版本号完全沿用上游（versionName / versionCode 都不改），保证两边版本对齐。
+on:
+  schedule:
+    # 每天 UTC 19:30（北京时间 03:30）检查一次
+    - cron: '30 19 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '跳过「已同步」判断，强制合并并重新发版'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.merge.outputs.updated }}
+      tag: ${{ steps.upstream.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: 配置 git 身份
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 查询上游最新 Release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/xibai6668/Android-AI-gateway/releases/latest | jq -r '.tag_name // empty')
+          if [ -z "$TAG" ]; then
+            echo "::error::取不到上游 Release 信息"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "上游最新 Release：$TAG"
+
+      - name: 合并上游标签
+        id: merge
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/xibai6668/Android-AI-gateway.git 2>/dev/null || true
+          # 上游 tag 存到独立命名空间，避免与本站同名发布 tag 冲突
+          git fetch --force --no-tags upstream "+refs/tags/${TAG}:refs/remotes/upstream-tags/${TAG}"
+          UPSTREAM_SHA=$(git rev-parse "refs/remotes/upstream-tags/${TAG}")
+          echo "上游 ${TAG} -> ${UPSTREAM_SHA}"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "本仓库已包含上游 ${TAG}"
+            if [ "${FORCE:-false}" != "true" ]; then
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "force=true，继续重新合并并发布"
+          fi
+
+          if ! git merge --no-ff --no-edit "$UPSTREAM_SHA" -m "chore(sync): 合并上游 ${TAG}"; then
+            echo "::error::上游 ${TAG} 与本地改动冲突，需要人工解决"
+            git status --short
+            git merge --abort || true
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          git push origin HEAD:main
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "已合并上游 ${TAG} 并推送 main"
+
+      - name: 冲突时开 issue 提醒
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          BODY=$(printf '自动同步上游 Release %s 时合并冲突，本次未发版。\n\n本地改动与上游改到同一处，需要手动 rebase/merge 解决后重新运行本 workflow。\n\n日志：%s' "$TAG" "$RUN_URL")
+          gh issue create --title "上游 ${TAG} 自动合并失败，需要人工介入" --body "$BODY" \
+            || echo "issue 创建失败（权限不足或已存在），请看 Actions 日志"
+
+  release:
+    needs: sync
+    if: needs.sync.outputs.updated == 'true'
+    uses: ./.github/workflows/android-release.yml
+    secrets: inherit
