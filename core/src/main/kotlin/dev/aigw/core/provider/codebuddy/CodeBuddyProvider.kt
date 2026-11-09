@@ -105,15 +105,27 @@ class CodeBuddyProvider internal constructor(
         return model
     }
 
-    /**
-     * 上游域名后缀（代理分流的判定依据）。
-     *
-     * 注意成长中心分为**插件链路**（`copilot.tencent.com` / `codebuddy.cn`）与
-     * **网页链路**（`workbuddy.cn`），两条路用的是不同身份头，域名都要列上，
-     * 否则代理开关对网页链路不生效。
-     */
+    /** 上游域名后缀（代理分流的判定依据）：国内 + 国际两套站点。 */
     override fun hosts(): List<String> =
-        listOf("copilot.tencent.com", "codebuddy.cn", "workbuddy.cn", "codebuddy.ai", "workbuddy.ai")
+        regionHosts(REGION_CN) + regionHosts(REGION_GLOBAL)
+
+    /**
+     * 按区域分开返回上游域名：国内站与国际站是两套不同站点，代理开关要能分别控制。
+     *
+     * 国内：插件链路（`copilot.tencent.com` / `codebuddy.cn`）与网页链路（`workbuddy.cn`）；
+     * 国际：`workbuddy.ai` / `codebuddy.ai`（旧域名）。
+     */
+    override fun hosts(region: String?): List<String> = when (region) {
+        null -> hosts()
+        REGION_GLOBAL -> regionHosts(REGION_GLOBAL)
+        else -> regionHosts(REGION_CN)
+    }
+
+    private fun regionHosts(region: String): List<String> = if (region == REGION_GLOBAL) {
+        listOf("workbuddy.ai", "codebuddy.ai")
+    } else {
+        listOf("copilot.tencent.com", "codebuddy.cn", "workbuddy.cn")
+    }
 
     // ------------------------------------------------------------------ 对话
 
@@ -910,6 +922,16 @@ class CodeBuddyProvider internal constructor(
                 "{}",
                 billingHeaders(credential),
             )
+            val message = extractMessage(text)
+            // 「今天已签到」上游有两种返回形态：HTTP 200 + 业务码，以及 **HTTP 400 + 错误正文**。
+            // 后者过去在 status 分支里直接判失败，导致自动签到把幂等回应当成故障：整批永远
+            // 「部分失败」、不记完成日、每小时重试一次。幂等判定必须在状态检查之前，
+            // 且不能只认 200 —— 对「今天已经做过」这件事，4xx 也是成功。
+            if (message.contains("已签到") || message.contains("already") ||
+                message.contains("明天再来") || message.contains("明日再来")
+            ) {
+                return ProviderActionResult.success("今日已签到")
+            }
             if (status !in 200..299) {
                 return ProviderActionResult.failure(
                     failure("签到", endpoint(credential), "${billingBase(credential)}$PATH_CHECKIN", status, text),
@@ -917,12 +939,7 @@ class CodeBuddyProvider internal constructor(
             }
             val code = runCatching { JsonParser.parseString(text).asJsonObject.get("code")?.asLong }.getOrNull() ?: -1L
             if (code == 0L) return ProviderActionResult.success("签到成功")
-            val message = extractMessage(text)
-            if (message.contains("已签到") || message.contains("already")) {
-                ProviderActionResult.success("今日已签到")
-            } else {
-                ProviderActionResult.failure(message.ifEmpty { "签到失败（code=$code）" })
-            }
+            ProviderActionResult.failure(message.ifEmpty { "签到失败（code=$code）" })
         } catch (e: Exception) {
             ProviderActionResult.failure(e.message ?: "签到失败")
         }

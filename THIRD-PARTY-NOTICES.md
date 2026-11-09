@@ -9,7 +9,21 @@
 
 ## 一、开源项目
 
-### 1. CLIProxyAPI
+### 1. rikkahub
+
+- 地址：https://github.com/rikkahub/rikkahub
+- 作者：rikkahub 及贡献者
+- 许可证：AGPL-3.0
+- 借鉴内容（ChatGPT/Codex 通道，**仅协议事实与行为结论，未复制任何代码**）：
+  - Codex OAuth 的参数形状（client_id、scope、PKCE S256、`localhost:1455/auth/callback`、
+    `codex_cli_simplified_flow`、`originator`）与 JWT claim 路径（`https://api.openai.com/auth`）
+  - Codex `/responses` 请求体约束（`store:false`、`include reasoning.encrypted_content`、
+    system→developer、tools `strict:false`、不支持采样参数）与 SSE 事件表
+  - 订阅档位显示名映射（`prolite`→Pro、`pro`→Pro (More)、`promax`→Pro (Max)）
+  - 「上游 SSE 不依赖 Content-Type」的兼容事实与 5 分钟刷新余量
+  - 说明：以上是行为/协议事实（事实不受版权保护）；实现全部为重写，未复制其代码或结构
+
+### 2. CLIProxyAPI
 
 - 地址：https://github.com/router-for-me/CLIProxyAPI
 - 作者：router-for-me 及贡献者
@@ -22,7 +36,7 @@
   - `invalid_grant` 按 401 语义降温（issue #4130）、临期 5 分钟才刷新的安全窗口
   - 空响应必须保持可检测为失败（`CustomProviderEmptyResponseTest` 锁住的行为）
 
-### 2. magpie
+### 3. magpie
 
 - 地址：https://github.com/yetone/magpie
 - 作者：yetone 及贡献者
@@ -32,8 +46,20 @@
   - 「Claude Code / Codex CLI 特征文本」替换表——上游以 `Illegal API invocation from an unapproved channel`
     拒绝带这些特征文本的请求，替换表来自其用真实客户端逐词实测的结论
   - 错误分类与重试口径的对照
+- 借鉴内容（网关后台能力，**仅设计思路与行为口径，未复制任何代码**；其实现为 Go + 内嵌 JS，本项目为 Kotlin）：
+  - 客户端密钥与上游凭证分离、每密钥可命名/启停/轮换、模型白名单、多窗口限额（日/周/月/每 N 小时），
+    以及「超额在打上游之前拒绝 + 429 带 Retry-After 与重置时刻」的口径（`gateway/ClientKeys.kt`）
+  - 会话亲和的分档思想（一轮内必保持、跨轮在缓存值得留时保持）与「亲和失败绝不阻断请求」
+    （`gateway/SessionAffinity.kt` 取「一轮内必保持」为默认）
+  - 路由组的规则维度（token 阈值/图片/压缩请求/工作目录/时段与星期）与「规则只在一轮开始时判定」
+    （`gateway/RoutingGroups.kt`）
+  - 请求/尝试分层计量（一次请求被重试接住不算失败）、未定价调用「不计为 0 而是标未定价」
+    （`usage/CallLogStore.kt`、`usage/ModelPricing.kt`）
+  - 中间件钩子「抛异常或超时即视为未改动」的容错铁律（`gateway/GatewayMiddleware.kt`）
+  - 可观测内部 API 的划分（路由预览 / 用量 / 限额自查）与「密钥只看得到自己的额度」
+    （`gateway/GatewayHttpServer.kt`）
 
-### 3. workbuddy2api-panel
+### 4. workbuddy2api-panel
 
 - 地址：https://github.com/linguo2625469/workbuddy2api-panel
 - 作者：linguo2625469
@@ -43,7 +69,7 @@
   - 工具结果后紧跟 user 消息时插入一条空 assistant（上游 400 11153）
   - 成长任务接口 `/v2/activity/growth/tasks` 的字段口径
 
-### 4. workbuddy-api
+### 5. workbuddy-api
 
 - 地址：https://github.com/simplast/workbuddy-api
 - 作者：simplast
@@ -53,7 +79,7 @@
     本项目把该算法抽到 `core/.../protocol/ConversationFingerprint.kt`，WorkBuddy 与 Loomy 共用
   - 官方 CLI 的会话 ID 头族（`X-Conversation-Request-ID` / `X-Conversation-Message-ID` 等）
 
-### 5. multi2api
+### 6. multi2api
 
 - 地址：https://github.com/Practice019/multi2api
 - 作者：Practice019
@@ -62,7 +88,7 @@
   - Loomy 错误分类「先正文 marker、后状态码」的顺序（上游失效信号常是 HTTP 200 + 业务码）
   - 多账号池、熔断与重试策略的对照
 
-### 6. loomy2api
+### 7. loomy2api
 
 - 地址：https://github.com/Patrick130306/loomy2api
 - 作者：Patrick130306
@@ -74,7 +100,7 @@
     积分模型 `availableBalance = balance + dailyBalance`
   - 该文档纠正了本项目 2.11.0 关于「Loomy 会话 id 决定缓存桶」的错误假设（2.11.2 已回滚）
 
-### 7. wild-work
+### 8. wild-work
 
 - 地址：https://github.com/rockswang/wild-work
 - 作者：rockswang
@@ -83,7 +109,7 @@
   - Trae 签到/积分接口对设备指纹头的要求（缺任一项上游以 9074「当前参与用户太多」拒绝）
   - Trae 国际版错误码与区域端点行为
 
-### 8. open-claude-ui
+### 9. open-claude-ui
 
 - 地址：https://github.com/Caho1/open-claude-ui
 - 作者：Caho1
@@ -125,7 +151,7 @@
   SOFTWARE.
   ```
 
-### 9. WorkBuddy-Daily
+### 10. WorkBuddy-Daily
 
 - 地址：https://github.com/L0NE-6/WorkBuddy-Daily
 - 作者：L0NE-6

@@ -122,18 +122,8 @@ class OpenAiSseTranslator(
     private var pendingUsage: JsonObject? = null
     private val gson = Gson()
 
-    /**
-     * 已产出的「正文 + 思维链」字符数，不含 SSE 帧的 JSON 包装。
-     *
-     * 长度兜底必须按内容字符计：每帧包装约 170 字符，按帧长度算会把 32000 的阈值
-     * 折算成一千来字，正常写一篇长回复都会被截断。
-     */
-    var contentChars: Long = 0L
-        private set
-
     fun translate(event: SoloEvent): List<String> = when (event) {
         is SoloEvent.Output -> {
-            contentChars += event.response.length + event.reasoning.length
             val delta = JsonObject()
             if (event.response.isNotEmpty()) delta.addProperty("content", event.response)
             if (event.reasoning.isNotEmpty()) delta.addProperty("reasoning_content", event.reasoning)
@@ -176,18 +166,6 @@ class OpenAiSseTranslator(
     }
 
     fun close(): List<String> = if (done) emptyList() else listOf(SSE_DONE)
-
-    /**
-     * 网关侧长度截断的收尾帧：补一个 `finish_reason=length` 的结束 chunk，再 `[DONE]`。
-     *
-     * 截断后上游的 `done` / `token_usage` 事件都被丢弃，若只发 `[DONE]` 客户端会当成
-     * 正常结束——用户看不出内容被截过，这次调用的用法统计也会缺一条。
-     */
-    fun truncate(reason: String = "length"): List<String> {
-        if (done) return emptyList()
-        done = true
-        return listOf(chunk(JsonObject(), reason), SSE_DONE)
-    }
     private fun chunk(delta: JsonObject, finishReason: String?): String {
         val choice = JsonObject().apply {
             addProperty("index", 0)
@@ -246,11 +224,6 @@ class OpenAiAggregator(
     private val toolCalls = LinkedHashMap<Int, JsonObject>()
     private var finishReason = "stop"
     private var usage: JsonObject? = null
-    private var truncated = false
-
-    /** 已聚合的「正文 + 思维链」字符数（不含 SSE 包装），供长度兜底判断。 */
-    var contentChars: Long = 0L
-        private set
 
     /** 流内业务错误，非 null 时调用方应换号或切换供应商。 */
     var failure: SoloStreamError? = null
@@ -260,17 +233,11 @@ class OpenAiAggregator(
     var soloCredits: Long? = null
         private set
 
-    /** 标记本次聚合被网关侧长度兜底截断（`finish_reason` 应报 length）。 */
-    fun markTruncated() {
-        truncated = true
-    }
-
     fun accept(event: SoloEvent) {
         when (event) {
             is SoloEvent.Output -> {
                 content.append(event.response)
                 reasoning.append(event.reasoning)
-                contentChars += event.response.length + event.reasoning.length
                 mergeToolCalls(event.toolCalls)
             }
             is SoloEvent.Usage -> usage = event.usage
@@ -296,7 +263,7 @@ class OpenAiAggregator(
         val choice = JsonObject().apply {
             addProperty("index", 0)
             add("message", message)
-            addProperty("finish_reason", if (truncated) "length" else finishReason)
+            addProperty("finish_reason", finishReason)
         }
 
         return JsonObject().apply {

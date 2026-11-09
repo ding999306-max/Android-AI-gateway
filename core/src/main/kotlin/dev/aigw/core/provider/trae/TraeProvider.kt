@@ -147,11 +147,19 @@ class TraeProvider(
      *
      * 只列网关自己会出站访问的 host（agent / 额度 / 鉴权）：登录页由系统浏览器打开，不走这里。
      */
-    override fun hosts(): List<String> =
-        TraeRegion.entries
-            .flatMap { listOf(it.agentHost, it.ugHost, it.oauthHost) }
+    override fun hosts(): List<String> = TraeRegion.entries
+        .flatMap { regionHosts(it) }
+        .distinct()
+
+    override fun hosts(region: String?): List<String> {
+        val target = TraeRegion.entries.firstOrNull { it.id.equals(region?.trim(), ignoreCase = true) }
+            ?: return hosts()
+        return regionHosts(target)
+    }
+
+    private fun regionHosts(region: TraeRegion): List<String> =
+        listOf(region.agentHost, region.ugHost, region.oauthHost)
             .map { it.removePrefix("https://") }
-            .distinct()
 
     // ------------------------------------------------------------------ 对话
 
@@ -180,25 +188,12 @@ class TraeProvider(
         if (isStreamingBody(openAiBody)) {
             val parser = SoloSseParser()
             val translator = OpenAiSseTranslator(newCompletionId(), model)
-            // 上游不认任何长度字段（见 TraeConstants.MAX_OUTPUT_CHARS 注释），
-            // 只能在网关侧按内容字符数硬截断：超阈值后丢弃后续增量、主动关闭上游连接，
-            // 并补一个 finish_reason=length 的收尾帧（不是裸 [DONE]），客户端能看出被截断。
-            var truncated = false
             val transformed = LineTransformStream(
                 source = stream,
                 transform = transform@{ line ->
-                    if (truncated) return@transform emptyList()
                     val event = parser.feed(line) ?: return@transform emptyList()
                     report(event, trae.uid)
-                    val out = translator.translate(event)
-                    // 按「正文 + 思维链」字符数计，不按 SSE 帧长度：每帧的 JSON 包装约 170
-                    // 字符，按帧算会把阈值折算成一千来字，正常长回复也会被误截。
-                    if (translator.contentChars > TraeConstants.MAX_OUTPUT_CHARS) {
-                        truncated = true
-                        runCatching { call.close() }
-                        return@transform translator.truncate()
-                    }
-                    out
+                    translator.translate(event)
                 },
                 onFinish = { translator.close() },
             )
@@ -214,12 +209,7 @@ class TraeProvider(
                     if (Thread.currentThread().isInterrupted) break
                     val event = parser.feed(line) ?: continue
                     aggregator.accept(event)
-                    // 上游不认长度字段，失控时会一路吐到 1.9 万 token。按内容字符数超阈值
-                    // 就停止读并断开上游——继续读只会等来一个注定被裁掉的结果（白等也白烧额度）。
-                    if (aggregator.contentChars > TraeConstants.MAX_OUTPUT_CHARS) {
-                        aggregator.markTruncated()
-                        break
-                    }
+
                 }
             }
         } catch (e: Exception) {
@@ -235,30 +225,7 @@ class TraeProvider(
                 UpstreamError(failure.kind.toErrorKind(), failure.message.ifEmpty { "上游流内错误" }, failure.code),
             )
         }
-        return AggregatedChatCall(200, clampAggregated(aggregator.build().toString()))
-    }
-
-    /**
-     * 非流式路径的输出截断。
-     *
-     * 读取循环已按内容字符数提前停止并断开上游（见 openChat），这里再对聚合出的
-     * JSON 做一次兜底裁剪：正文与思维链各自不超过上限，且保持结构合法。
-     */
-    private fun clampAggregated(json: String): String {
-        val obj = runCatching { JsonParser.parseString(json).asJsonObject }.getOrNull() ?: return json
-        val choices = obj.getAsJsonArray("choices") ?: return json
-        for (element in choices) {
-            val message = element.asJsonObject.getAsJsonObject("message") ?: continue
-            // 正文和思维链都会失控：推理模型的 reasoning 同样会一路吐到底，
-            // 只裁 content 等于给推理模型留了后门。
-            for (key in listOf("content", "reasoning_content")) {
-                val content = message.get(key) ?: continue
-                if (content.isJsonPrimitive && content.asString.length > TraeConstants.MAX_OUTPUT_CHARS) {
-                    message.addProperty(key, content.asString.take(TraeConstants.MAX_OUTPUT_CHARS))
-                }
-            }
-        }
-        return obj.toString()
+        return AggregatedChatCall(200, aggregator.build().toString())
     }
 
     /** 上游 200 却没回 SSE 时的改判：识别出业务码按 400 返回，让网关走 CLIENT 分支。 */

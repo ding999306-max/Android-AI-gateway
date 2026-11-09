@@ -140,26 +140,6 @@ object TraeConstants {
      */
     const val DEFAULT_CONFIG_NAME = "gpt-5.2"
 
-    /**
-     * 网关侧输出失控保护（字符数上限）。
-     *
-     * **上游不看任何长度字段。** 实测把 `max_tokens` 设成 1 请求「写一首长诗」，上游照样
-     * 吐满 19582 个 completion tokens / 20000 个 output 事件 —— 该字段被静默忽略；
-     * 另六个候选名（`max_completion_tokens` / `max_output_tokens` / `max_gen_tokens` /
-     * `max_new_tokens` / `generation_length` / `tokens_to_generate`）全部 4001 拒收。
-     * 即上游 Go 结构体根本不认长度字段。
-     *
-     * 默认模型 `gpt-5.2` 输出正常（实测单次 completion 仅数十 token），本阈值只是
-     * 防止某个模型突然失控时的兜底：超过后 [TraeProvider.openChat] 丢弃后续增量并关闭
-     * 上游连接，`onFinish` 仍执行，客户端正常收到收尾。
-     *
-     * 取 32000 字符（约 1.6 万汉字），足够覆盖正常长文回复，只在真正失控时才触发。
-     *
-     * 计数口径是**正文 + 思维链的内容字符数**，不含 SSE 帧的 JSON 包装（每帧约 170 字符）。
-     * 按帧长算会把阈值折算成一千来字，正常长文都会被误截。
-     */
-    const val MAX_OUTPUT_CHARS = 32000
-
     /** SOLO 通道计费落在 ide_credits 上（work_credits 不可反代）。 */
     const val REGION_CN = "trae.cn"
 }

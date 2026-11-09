@@ -264,32 +264,16 @@ class OpenAiSseTranslatorTest {
     }
 
     @Test
-    fun `contentChars 只统计正文和思维链，不含 SSE 包装`() {
+    fun `超过32000字符的流式内容完整输出`() {
         val translator = OpenAiSseTranslator("id1", "m")
-        translator.translate(SoloEvent.Output("你好", "思考", null))
-        translator.translate(SoloEvent.Output("世界", "", null))
-        // 2+2 + 2 = 6；若按整条 SSE 帧计，这里会是几百
-        assertEquals(6L, translator.contentChars)
-    }
-
-    @Test
-    fun `长度截断补 finish_reason=length 的收尾帧`() {
-        val translator = OpenAiSseTranslator("id1", "m")
-        translator.translate(SoloEvent.Output("很长的一段内容", "", null))
-        val tail = translator.truncate()
-        assertEquals(2, tail.size, "收尾帧 + DONE")
-        val chunk = JsonParser.parseString(tail[0].removePrefix("data: ").trim()).asJsonObject
-        val choice = chunk.getAsJsonArray("choices")[0].asJsonObject
-        assertEquals("length", choice.get("finish_reason").asString, "必须告诉客户端是被截断的")
-        assertEquals("data: [DONE]\n\n", tail[1])
-        assertTrue(translator.close().isEmpty(), "truncate 之后不应再补 DONE")
-    }
-
-    @Test
-    fun `已经写过 done 时 truncate 不再发帧`() {
-        val translator = OpenAiSseTranslator("id1", "m")
-        translator.translate(SoloEvent.Done("stop"))
-        assertTrue(translator.truncate().isEmpty())
+        val text = "文".repeat(40000)
+        val frames = translator.translate(SoloEvent.Output(text, text, null))
+        val delta = JsonParser.parseString(frames.single().removePrefix("data: ").trim())
+            .asJsonObject.getAsJsonArray("choices")[0].asJsonObject.getAsJsonObject("delta")
+        assertEquals(text, delta.get("content").asString)
+        assertEquals(text, delta.get("reasoning_content").asString)
+        val end = translator.translate(SoloEvent.Done("stop"))
+        assertTrue(end.first().contains("stop"))
     }
 
     @Test
@@ -348,13 +332,15 @@ class OpenAiAggregatorTest {
     }
 
     @Test
-    fun `内容计数与截断标记`() {
+    fun `超过32000字符的非流式内容完整聚合`() {
         val aggregator = OpenAiAggregator("id1", "m")
-        aggregator.accept(SoloEvent.Output("Hello", "想", null))
-        assertEquals(6L, aggregator.contentChars)
-        aggregator.markTruncated()
-        val out = aggregator.build()
-        assertEquals("length", out.getAsJsonArray("choices")[0].asJsonObject.get("finish_reason").asString)
+        val text = "文".repeat(40000)
+        aggregator.accept(SoloEvent.Output(text, text, null))
+        aggregator.accept(SoloEvent.Done("stop"))
+        val choice = aggregator.build().getAsJsonArray("choices")[0].asJsonObject
+        assertEquals(text, choice.getAsJsonObject("message").get("content").asString)
+        assertEquals(text, choice.getAsJsonObject("message").get("reasoning_content").asString)
+        assertEquals("stop", choice.get("finish_reason").asString)
     }
 
     @Test
