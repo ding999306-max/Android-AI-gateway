@@ -3,18 +3,23 @@ package dev.aigw.app.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -22,29 +27,32 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.zIndex
-import kotlin.math.roundToInt
+import dev.aigw.app.ui.theme.LocalAppColors
+import sh.calvin.reorderable.ReorderableItem
+import sh.calvin.reorderable.rememberReorderableLazyListState
+
 /**
  * 首页编辑态的可拖动列表。
  *
- * 拖拽而不是上下按钮：手机上一屏能看到的组件有限，反复点箭头挪一行要按很多次。
- * 长按进入拖动（[detectDragGesturesAfterLongPress]）而不是直接拖，是为了不和组件内部的点击、
- * 色轮的横向拖动抢手势。
+ * 拖拽排序用 `sh.calvin.reorderable`（Lawnchair / Home Assistant / ProtonVPN 在用的开源库），
+ * 它基于 Compose 官方的 `Modifier.animateItem` 做重排动画。
+ *
+ * 之前手写版本反复出问题，原因都是自己实现了同一件事：
+ * 在 LazyColumn 里既抢垂直手势、又叠加自定义 translationY，导致拖不动、条目重叠与空洞。
+ * 库把「手势识别 + 重排 + 位移动画」收敛成一套，只在 onMove 里改顺序即可。
  */
 @Composable
 internal fun EditableHomeWidgetList(
@@ -54,119 +62,109 @@ internal fun EditableHomeWidgetList(
     onRemove: (HomeWidget) -> Unit,
     content: @Composable (HomeWidget) -> Unit,
 ) {
-    val density = LocalDensity.current
-    var dragging by remember { mutableStateOf<HomeWidget?>(null) }
-    var dragOffset by remember { mutableFloatStateOf(0f) }
+    val haptics = LocalHapticFeedback.current
+    val visible = remember(order, hidden) { order.filterNot { it in hidden } }
 
-    // 手势块只在组装时建立一次；顺序换位后不能重启指针输入，
-    // 否则拖动进行到一半时 pointerInput 被重建，手一离开就断了（表现为一次只能挪一格）。
-    val currentOrder by rememberUpdatedState(order)
-    val currentHidden by rememberUpdatedState(hidden)
-    val currentOnReorder by rememberUpdatedState(onReorder)
-
-    // 每个条目实测高度（含卡片间距），拖拽过半就是换位
-    val rowHeights = remember { HashMap<HomeWidget, Int>() }
-
-    // 换位逻辑抽成函数：onDrag 是嵌套 lambda，用 return@detectDragGesturesAfterLongPress
-    // 从里面返回并不合法（那是给 onDrag 外层用的），只能靠函数提前退出。
-    fun handleDrag(widget: HomeWidget, deltaY: Float): Float {
-        val visible = currentOrder.filterNot { it in currentHidden }
-        val from = visible.indexOf(widget)
-        if (from < 0) return deltaY
-        val threshold = with(density) { (rowHeights[widget] ?: 0).toFloat() / 2f }
-        if (threshold <= 0f) return deltaY
-        val direction = when {
-            deltaY > threshold -> 1
-            deltaY < -threshold -> -1
-            else -> 0
-        }
-        if (direction == 0) return deltaY
-        val to = from + direction
-        if (to !in visible.indices) return deltaY
-        val reordered = visible.toMutableList().apply { add(to, removeAt(from)) }
-        // 只把可见项的新相对顺序合并回完整顺序，隐藏项原地不动
-        val merged = currentOrder.toMutableList()
-        val visibleSlots = merged.indices.filter { merged[it] !in currentHidden }
-        visibleSlots.forEachIndexed { index, slot -> merged[slot] = reordered[index] }
-        currentOnReorder(merged)
-        return deltaY - direction * threshold * 2f
+    // 拖动过程中只改这份本地列表，松手才回调，避免每帧写盘
+    val items = remember(order, hidden) { visible.toMutableStateList() }
+    val lazyListState = rememberLazyListState()
+    val reorderState = rememberReorderableLazyListState(lazyListState) { from, to ->
+        items.add(to.index, items.removeAt(from.index))
+        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
     }
 
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        order.filterNot { it in hidden }.forEach { widget ->
-            val isDragging = dragging == widget
-            val dragModifier = Modifier
-                .fillMaxWidth()
-                .zIndex(if (isDragging) 1f else 0f)
-                .graphicsLayer { translationY = if (isDragging) dragOffset else 0f }
-                .pointerInput(widget) {
-                    detectDragGesturesAfterLongPress(
-                        onDragStart = {
-                            dragging = widget
-                            dragOffset = 0f
-                        },
-                        onDragEnd = {
-                            dragging = null
-                            dragOffset = 0f
-                        },
-                        onDragCancel = {
-                            dragging = null
-                            dragOffset = 0f
-                        },
-                        onDrag = { change, amount ->
-                            change.consume()
-                            dragOffset = handleDrag(widget, dragOffset + amount.y)
-                        },
-                    )
-                }
-            Box(modifier = dragModifier) {
-                Box(modifier = Modifier.onMeasured { rowHeights[widget] = it }) {
-                    EditableWidgetFrame(
-                        title = widget.title,
-                        onRemove = { onRemove(widget) },
-                    ) {
-                        content(widget)
-                    }
+    LazyColumn(
+        state = lazyListState,
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(ItemSpacing),
+        contentPadding = PaddingValues(bottom = 24.dp),
+    ) {
+        items(items, key = { it }) { widget ->
+            ReorderableItem(reorderState, key = widget) { isDragging ->
+                // longPressDraggableHandle 只能在 ReorderableItem 的 scope 里创建
+                EditableWidgetFrame(
+                    title = widget.title,
+                    dragging = isDragging,
+                    onRemove = { onRemove(widget) },
+                    contentModifier = Modifier.longPressDraggableHandle(),
+                ) {
+                    content(widget)
                 }
             }
+        }    }
+
+    // 松手（或外部改布局）时把本地顺序落盘
+    val committed = reorderState.isAnyItemDragging
+    LaunchedEffect(committed, items.toList()) {
+        if (!committed) {
+            val current = items.toList()
+            if (current != visible) {
+                // 只把可见项的新相对顺序合并回完整顺序，隐藏项原地不动
+                val merged = order.toMutableList()
+                val slots = merged.indices.filter { merged[it] !in hidden }
+                slots.forEachIndexed { index, slot ->
+                    current.getOrNull(index)?.let { merged[slot] = it }
+                }
+                onReorder(merged)
+            }
+        }
+    }
+
+    // 外部把组件加回来时同步本地列表
+    LaunchedEffect(visible, committed) {
+        if (!committed && items.toList() != visible) {
+            items.clear()
+            items.addAll(visible)
         }
     }
 }
 
-/** 编辑态外壳：虚线描边 + 顶部标题条 + 右侧删除。 */
+private val ItemSpacing = 12.dp
+
+/** 编辑态外壳：拖动手柄 + 标题 + 右侧移除。 */
 @Composable
 private fun EditableWidgetFrame(
     title: String,
+    dragging: Boolean,
     onRemove: () -> Unit,
-    content: @Composable () -> Unit,
+    contentModifier: Modifier,
+    content: @Composable ColumnScope.() -> Unit,
 ) {
     val shape = MaterialTheme.shapes.large
+    val borderColor = if (dragging) {
+        LocalAppColors.current.goldStart
+    } else {
+        MaterialTheme.colorScheme.outlineVariant
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(shape)
-            .border(1.dp, MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f), shape)
-            .padding(4.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+            .border(1.dp, borderColor, shape)
+            .background(MaterialTheme.colorScheme.surface),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(MaterialTheme.shapes.small)
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-                .padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                .padding(start = 10.dp, end = 2.dp, top = 2.dp, bottom = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            Icon(
+                Icons.Filled.DragHandle,
+                contentDescription = "拖动排序",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp),
+            )
             Text(
                 text = title,
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.padding(start = 8.dp).weight(1f),
             )
             Box(
                 modifier = Modifier
-                    .size(28.dp)
+                    .size(40.dp)
                     .clip(CircleShape)
                     .clickable(onClick = onRemove),
                 contentAlignment = Alignment.Center,
@@ -175,11 +173,12 @@ private fun EditableWidgetFrame(
                     Icons.Filled.Close,
                     contentDescription = "移除 $title",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(16.dp),
+                    modifier = Modifier.size(17.dp),
                 )
             }
         }
-        content()
+        // 手柄作用在内容区：长按组件正文即可拖动，符合「抓起来搬」的直觉
+        Column(modifier = Modifier.padding(4.dp).then(contentModifier), content = content)
     }
 }
 
@@ -191,7 +190,7 @@ internal fun HomeEditAction(editing: Boolean, onClick: () -> Unit) {
             .clip(CircleShape)
             .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
             .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 6.dp),
+            .padding(start = 12.dp, end = 14.dp, top = 6.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(5.dp),
     ) {
@@ -261,7 +260,7 @@ internal fun AddHomeWidgetDialog(
     )
 }
 
-/** 页头在编辑态的提示条：说明当前能做什么。 */
+/** 页头在编辑态的提示条。 */
 @Composable
 internal fun HomeEditHint(isEmpty: Boolean) {
     Row(
@@ -273,13 +272,9 @@ internal fun HomeEditHint(isEmpty: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = if (isEmpty) "首页没有组件，点右上角「+」添加" else "长按拖动调整顺序，点组件右上角移除",
+            text = if (isEmpty) "首页没有组件，点右上角「+」添加" else "长按拖动调整顺序，点右上角移除",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
-
-/** 记录条目高度，用于计算拖拽换位的阈值。 */
-private fun Modifier.onMeasured(onSize: (Int) -> Unit): Modifier =
-    this.onSizeChanged { onSize(it.height) }
