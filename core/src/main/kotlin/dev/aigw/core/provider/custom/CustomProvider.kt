@@ -37,7 +37,6 @@ import java.net.HttpURLConnection
  */
 class CustomProvider(
     private val config: CustomProviderConfig,
-    private val nowMillis: () -> Long = System::currentTimeMillis,
 ) : Provider {
 
     override val id: String = config.providerId

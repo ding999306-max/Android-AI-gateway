@@ -39,10 +39,12 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalContext
+import dev.chrisbanes.haze.HazeInput
 import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.HazeStyle
-import dev.chrisbanes.haze.HazeTint
-import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.blur.HazeBlurStyle
+import dev.chrisbanes.haze.blur.HazeColorEffect
+import dev.chrisbanes.haze.blur.hazeBlur
 import dev.chrisbanes.haze.hazeSource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
@@ -83,12 +85,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.aigw.app.data.CrashReporter
 import dev.aigw.app.service.GatewayTileService
 import dev.aigw.app.ui.pushPopSpec
 import dev.aigw.app.ui.tabContentSpec
 import dev.aigw.app.ui.LocalBottomContentPadding
 import dev.aigw.app.ui.AppUiState
 import dev.aigw.app.ui.ApiSettingsScreen
+import dev.aigw.app.ui.CrashLogScreen
 import dev.aigw.app.ui.AppViewModel
 import dev.aigw.app.ui.AppearanceThemeScreen
 import dev.aigw.app.ui.ThemeSettingsScreen
@@ -186,10 +190,25 @@ private enum class Tab(val label: String, val icon: ImageVector) {
 private fun AppRoot(viewModel: AppViewModel, state: AppUiState) {
     var tab by remember { mutableStateOf(Tab.Home) }
     var subPage by remember { mutableStateOf<SubPage?>(null) }
+    // 上次崩溃过就直接打开崩溃页：用户重进时最想看的就是「为什么崩了」
+    var crashChecked by remember { mutableStateOf(false) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     // 玻璃采样状态：内容层写入，底栏读取
     val hazeState = remember { HazeState() }
+    // 拿在组合上下文里，不能在 LaunchedEffect 的挂起体里调 @Composable
+    val context = LocalContext.current
+    LaunchedEffect(Unit) {
+        if (!crashChecked) {
+            crashChecked = true
+            // 只看「本次启动之前」写过的那一份：崩溃发生在上一进程，应用私有目录里的
+            // 最新文件就是它。消费一次后不再自动跳，避免每次启动都堵在崩溃页。
+            val latest = CrashReporter.list(context).firstOrNull()
+            if (latest != null && CrashReporter.consumeAutoOpen(context, latest)) {
+                subPage = SubPage.CrashLog
+            }
+        }
+    }
     LaunchedEffect(state.notice) {
         if (state.notice.isNotEmpty()) {
             snackbarHostState.showSnackbar(state.notice)
@@ -324,6 +343,7 @@ private fun AppRoot(viewModel: AppViewModel, state: AppUiState) {
                 SubPage.RoutingGroups -> RoutingGroupsScreen(state, viewModel) { subPage = null }
                 SubPage.ModelPricing -> ModelPricingScreen(state, viewModel) { subPage = null }
                 SubPage.RequestRewrite -> RequestRewriteScreen(state, viewModel) { subPage = null }
+                SubPage.CrashLog -> CrashLogScreen { subPage = null }
                 null -> MainTabs(
                     viewModel = viewModel,
                     state = state,
@@ -480,6 +500,21 @@ private fun DockedNavBar(tab: Tab, subPage: SubPage?, onSelect: (Tab) -> Unit) {
 private fun FloatingNavBar(tab: Tab, subPage: SubPage?, haze: HazeState, onSelect: (Tab) -> Unit) {
     val selectedGold = LocalAppColors.current.goldStart
     val isLight = MaterialTheme.colorScheme.background.luminance() > 0.5f
+    val tintAlpha = if (isLight) 0.18f else 0.14f
+    val surfaceColor = MaterialTheme.colorScheme.surface
+    // 2.x 的 Style 按引用比较，每次重组新建会反复替换节点，必须 remember。
+    val glassStyle = remember(surfaceColor, tintAlpha) {
+        HazeBlurStyle {
+            backgroundColor(Color.Transparent)
+            blurRadius(40.dp)
+            noiseFactor(0.04f)
+            colorEffects(
+                listOf(
+                    HazeColorEffect.tint(surfaceColor.copy(alpha = tintAlpha)),
+                ),
+            )
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -500,18 +535,9 @@ private fun FloatingNavBar(tab: Tab, subPage: SubPage?, haze: HazeState, onSelec
                 .clip(CircleShape)
                 // 玻璃本体：模糊背景 + 极浅色调。不透明度必须低，
                 // 否则实色会把模糊盖住，看上去就是一块普通半透明底。
-                .hazeEffect(
-                    state = haze,
-                    style = HazeStyle(
-                        backgroundColor = Color.Transparent,
-                        tints = listOf(
-                            HazeTint(
-                                color = MaterialTheme.colorScheme.surface.copy(alpha = if (isLight) 0.18f else 0.14f),
-                            ),
-                        ),
-                        blurRadius = 40.dp,
-                        noiseFactor = 0.04f,
-                    ),
+                .hazeBlur(
+                    input = HazeInput.Sources(haze),
+                    style = glassStyle,
                 )
                 .drawWithContent {
                     drawContent()

@@ -66,8 +66,11 @@ class GatewayHttpServer(
         val uri = session.uri.trimEnd('/').ifEmpty { "/" }
         val response = try {
             when {
-                session.method == NanoHTTPD.Method.OPTIONS -> run { drainBody(session); preflight() }
+                session.method == NanoHTTPD.Method.OPTIONS -> run { drainBody(session); preflight(session) }
                 session.method == NanoHTTPD.Method.POST && uri == "/v1/chat/completions" -> chatCompletions(session)
+                // Anthropic Messages 协议入口：Claude Code 这类客户端只讲这个协议，
+                // 进来先翻成 OpenAI 请求，出去再把响应翻回 Anthropic 形状
+                session.method == NanoHTTPD.Method.POST && uri == "/v1/messages" -> chatCompletions(session, inboundAnthropic = true)
                 session.method == NanoHTTPD.Method.POST && uri == "/v1/images/generations" -> imageGenerations(session)
                 session.method == NanoHTTPD.Method.POST && uri == "/v1/audio/transcriptions" -> audioTranscriptions(session)
                 session.method == NanoHTTPD.Method.GET && uri == "/v1/models" -> models(session)
@@ -79,6 +82,8 @@ class GatewayHttpServer(
                 session.method == NanoHTTPD.Method.GET && uri == "/v1/usage" -> usageSummary(session)
                 session.method == NanoHTTPD.Method.GET && uri == "/v1/usage/requests" -> usageRequests(session)
                 session.method == NanoHTTPD.Method.GET && uri == "/v1/limit" -> keyLimit(session)
+                // Prometheus 拉取端点：只给本机（与 /v1/health 同权限，不向局域网暴露）
+                session.method == NanoHTTPD.Method.GET && uri == "/metrics" -> metrics(session)
                 session.method == NanoHTTPD.Method.GET && uri == "/healthz" ->
                     NanoHTTPD.newFixedLengthResponse(SimpleStatus(200, "OK"), "text/plain; charset=utf-8", "ok")
                 session.method == NanoHTTPD.Method.GET && uri == "/authorize" -> authorize(session)
@@ -93,25 +98,48 @@ class GatewayHttpServer(
             engine.logError("处理 $uri 失败：${e.message}")
             errorResponse(500, "internal_error", e.message ?: "网关内部错误")
         }
-        return response.withCors()
+        return response.applyCors(session)
     }
 
     /**
      * 浏览器里跑的客户端（各种 Web UI）会先发 OPTIONS 预检，不答应就会被浏览器拦掉，
      * 界面上看起来就是「连不上」。
      */
-    private fun preflight(): NanoHTTPD.Response =
+    private fun preflight(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response =
         NanoHTTPD.newFixedLengthResponse(SimpleStatus(204, "No Content"), "text/plain; charset=utf-8", "")
+            .applyCors(session)
 
-    /** 流式响应自己写头（已含 CORS），这里的 addHeader 对它无效但无害。 */
-    private fun NanoHTTPD.Response.withCors(): NanoHTTPD.Response = apply {
-        addHeader("Access-Control-Allow-Origin", "*")
-        addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        addHeader("Access-Control-Allow-Headers", "*")
+    /**
+     * CORS 头。
+     *
+     * 白名单为空时回 `*`（旧行为，不破坏已在用的浏览器客户端）；
+     * 填了就只对命中名单的 Origin 回显它自己，其余一律不发 CORS 头——
+     * 浏览器侧会被同源策略拦下，于是「局域网暴露时任意网页都能用你的额度」这条路就堵上了。
+     */
+    private fun NanoHTTPD.Response.applyCors(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response = apply {
+        val allowed = corsOriginFor(session)
+        if (allowed != null) {
+            addHeader("Access-Control-Allow-Origin", allowed)
+            addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            addHeader("Access-Control-Allow-Headers", "*")
+            // 按 Origin 回显时必须是 Vary: Origin，否则中间缓存会把 A 站点的响应给 B 站点
+            if (allowed != "*") addHeader("Vary", "Origin")
+        }
         // 非流式响应一律不复用连接：NanoHTTPD 的 keep-alive 是「处理完再阻塞读下一个请求」，
         // 空闲连接会一直占着工作线程直到 socket 读超时（60s），并发一多线程就被这些空转连接吃光，
         // 真正要转发的请求只能排队。OpenAI 客户端每次请求都新建连接，放弃复用代价极小。
         if (this !is SseResponse) closeConnection(true)
+    }
+
+    /** 命中白名单时返回要回显的 Origin；空名单返回 `*`；未命中返回 null（不发 CORS 头）。 */
+    private fun corsOriginFor(session: NanoHTTPD.IHTTPSession): String? {
+        val configured = engine.settings().corsAllowedOrigins
+            .split(',', '\n')
+            .map { it.trim().trimEnd('/') }
+            .filter { it.isNotEmpty() }
+        if (configured.isEmpty()) return "*"
+        val origin = session.headers["origin"]?.trim()?.trimEnd('/') ?: return null
+        return if (configured.any { it.equals(origin, ignoreCase = true) }) origin else null
     }
 
     // ------------------------------------------------------------------ 端点
@@ -337,18 +365,24 @@ class GatewayHttpServer(
         return root.toString()
     }
 
-    private fun chatCompletions(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+    private fun chatCompletions(session: NanoHTTPD.IHTTPSession, inboundAnthropic: Boolean = false): NanoHTTPD.Response {
         val auth = checkAuth(session)
         if (!auth.ok) return unauthorized(session)
         val clientKey = auth.clientKey
 
-        val (body, readResult) = readBody(session)
+        val (rawBody, readResult) = readBody(session)
         if (readResult == BodyReadResult.OVER_LIMIT) {
             return errorResponse(413, "payload_too_large", "请求体超过网关 ${MAX_BODY_BYTES / (1024 * 1024)}MB 上限")
         }
-        if (body.isEmpty()) {
-            logInvalidBody(session, body, "请求体为空")
+        if (rawBody.isEmpty()) {
+            logInvalidBody(session, rawBody, "请求体为空")
             return errorResponse(400, "invalid_request", "请求体为空")
+        }
+        val body = if (inboundAnthropic) {
+            dev.aigw.core.protocol.AnthropicMessages.toOpenAiRequest(rawBody)
+                ?: return errorResponse(400, "invalid_request", "请求体不是合法的 Anthropic Messages 请求")
+        } else {
+            rawBody
         }
         val peek = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull()
         if (peek == null) {
@@ -422,7 +456,7 @@ class GatewayHttpServer(
         val failoverCfg = engine.failoverSettings()
         if (engine.verboseLogging()) {
             log("收到请求 /v1/chat/completions：model=$requestedModel stream=$streaming，已解析路由 ${primaryRoute.providerId}/${primaryRoute.model}")
-            engine.logVerbose("请求原文", body)
+            engine.logVerbose("请求原文", redactForLog(body))
         }
 
         // 首选路由优先；失败后做同款模型 Failover
@@ -515,6 +549,9 @@ class GatewayHttpServer(
             val secSettings = engine.securitySettings()
             // 反审核脱敏：仅改写 system 消息内的敏感词（注入零宽空格），完全不触碰 user 输入
             val sanitized = engine.sanitizer.sanitizeOpenAiBody(prepared, resolvedModel, secSettings.sanitizeEnabled)
+            // 本地隐私脱敏：出网前把 API Key / 邮箱换成占位符，响应回来后还原（见 PrivacyRedactor）
+            val (outbound, privacySession) =
+                engine.privacyRedactor.redactOpenAiBody(sanitized, secSettings.privacyRedactionEnabled)
 
             val tried = HashSet<String>()
             var attempt = 0
@@ -582,7 +619,7 @@ class GatewayHttpServer(
 
                 if (engine.verboseLogging()) {
                     log("第 $attempt 次选号（$providerId）：${picked.nickname.ifEmpty { picked.uid }}，发送模型 $resolvedModel")
-                    engine.logVerbose("转发内容", sanitized)
+                    engine.logVerbose("转发内容", outbound)
                 }
 
                 var account = picked
@@ -632,8 +669,19 @@ class GatewayHttpServer(
 
                 val attemptStart = System.currentTimeMillis()
                 attemptedUpstream = true
+                // 风控提示词替换：改写系统轨里会被上游当成反代特征的句子。
+                // 放在选号之后做，取证记录才能带上真实的供应商 id。
+                val rewrittenOutbound = engine.promptRewriter.rewriteOpenAiBody(
+                    outbound,
+                    currentRoute.providerId,
+                    resolvedModel,
+                    secSettings.promptRewriteEnabled,
+                )
+                if (engine.verboseLogging() && rewrittenOutbound != outbound) {
+                    engine.logVerbose("风控替换", rewrittenOutbound)
+                }
                 val call: ChatCall = try {
-                    provider.openChat(account, sanitized)
+                    provider.openChat(account, rewrittenOutbound)
                 } catch (e: Exception) {
                     val elapsed = System.currentTimeMillis() - attemptStart
                     providerLastError = e.message ?: "上游连接失败"
@@ -870,6 +918,12 @@ class GatewayHttpServer(
                             gateHandle.release()
                             engine.activeRequests.finish(activeId)
                         },
+                        privacySession = privacySession,
+                        sseTranslator = if (inboundAnthropic) {
+                            dev.aigw.core.protocol.AnthropicMessages.SseTranslator(transparentModel)
+                        } else {
+                            null
+                        },
                     )
                 }
 
@@ -880,7 +934,7 @@ class GatewayHttpServer(
                     }
                     finishActiveRequest()
                     gateHandle.release()
-                    return aggregatedResponse(aggregated, currentRoute.providerId, transparentModel, account.uid, account.nickname, startedAt, body, call.status, meta = callMeta)
+                    return aggregatedResponse(aggregated, currentRoute.providerId, transparentModel, account.uid, account.nickname, startedAt, body, call.status, meta = callMeta, privacySession = privacySession, anthropicInbound = inboundAnthropic)
                 }
 
                 call.close()
@@ -1379,6 +1433,8 @@ class GatewayHttpServer(
         meta: CallMeta = CallMeta(),
         onFirstChunk: () -> Unit = {},
         onFinished: () -> Unit = {},
+        privacySession: dev.aigw.core.security.PrivacyRedactor.Session = dev.aigw.core.security.PrivacyRedactor.Session.EMPTY,
+        sseTranslator: dev.aigw.core.protocol.AnthropicMessages.SseTranslator? = null,
     ): NanoHTTPD.Response {
         val id = newCompletionId()
         // 转发结果快照：由 produce 在结束时写入。header 写出失败时 produce 不执行，
@@ -1429,9 +1485,10 @@ class GatewayHttpServer(
             // 曾把同一事件的多行攒到 8KB 再 flush 以减少小包，但那会让不发空行分隔的上游
             // 迟迟不出首字（客户端要等积满 8KB）——首字延迟优先级高于节省小包。
             val batch = StringBuilder(1024)
+            // 隐私脱敏会话非空时才启用还原：正常路径零影响
+            val privacyRestorers = if (privacySession.active) HashMap<String, dev.aigw.core.security.PrivacyRedactor.StreamingRestorer>() else null
             try {
-                stream.bufferedReader(Charsets.UTF_8).use { reader ->
-                    while (true) {
+                stream.bufferedReader(Charsets.UTF_8).use { reader ->                    while (true) {
                         val line = reader.readLine() ?: break
                         // 先把行原样透传，再看一眼统计：解析绝不能影响转发。
                         // 上游 chunk 里 `"usage": null` 这类字段用 Gson 裸转换是会抛异常的，
@@ -1447,7 +1504,13 @@ class GatewayHttpServer(
                             if (line.removePrefix("data:").trim() == "[DONE]") sawDone = true
                         }
                         rawLines.append(line + "\n")
-                        batch.append(line).append("\n\n")
+                        val outgoing = privacyRestorers?.let { restoreStreamLine(line, privacySession, it) } ?: line
+                        if (sseTranslator != null) {
+                            // Anthropic 入口：把 OpenAI 增量翻成有结构的 Anthropic 事件序列
+                            batch.append(sseTranslator.translate(outgoing))
+                        } else {
+                            batch.append(outgoing).append("\n\n")
+                        }
                         flushBatch(batch, writer)
                         if (!firstChunkLogged && line.startsWith("data:")) {
                             firstChunkLogged = true
@@ -1486,6 +1549,23 @@ class GatewayHttpServer(
                 failure = "网关转发流出错：${e.message}"
                 engine.logError("转发 $providerId 的流失败：$e")
             } finally {
+                // 隐私还原的尾巴（可能含一个被切开的占位符）必须在这里交出，否则内容丢一截
+                if (privacyRestorers != null) {
+                    for ((key, restorer) in privacyRestorers) {
+                        val tail = restorer.flush()
+                        if (tail.isNotEmpty()) {
+                            val tailLine = "data: " + streamTailFrame(key, tail)
+                            runCatching {
+                                if (sseTranslator != null) writer.write(sseTranslator.translate(tailLine))
+                                else writer.write(tailLine + "\n\n")
+                            }
+                        }
+                    }
+                }
+                // Anthropic 流要有明确的收尾事件，否则客户端会一直等 message_stop
+                if (sseTranslator != null) {
+                    runCatching { writer.write(sseTranslator.close()) }
+                }
                 // 上游一条 data 都没给：不能静默结束，否则客户端只看到「输出完成却空」
                 if (status == CallStatus.SUCCESS && !sawData) {
                     status = CallStatus.FAILED
@@ -1546,12 +1626,54 @@ class GatewayHttpServer(
         val firstByteMillis: Long = -1,
     )
 
+    /** 把流结束时攒下的还原尾巴包成一帧 OpenAI 增量。 */
+    private fun streamTailFrame(field: String, text: String): String = JsonObject().apply {
+        add("choices", JsonArray().apply {
+            add(JsonObject().apply {
+                addProperty("index", 0)
+                add("delta", JsonObject().apply { addProperty(field, text) })
+                addProperty("finish_reason", null as String?)
+            })
+        })
+    }.toString()
+
     /** 把累积的 SSE 行批量写出；非空则写出并清空缓冲，返回是否有内容。 */
     private fun flushBatch(batch: StringBuilder, writer: ChunkWriter): Boolean {
         if (batch.isEmpty()) return false
         writer.write(batch.toString())
         batch.setLength(0)
         return true
+    }
+
+    /**
+     * 流式隐私还原：只改 `data:` 行里的文本增量，其它行原样透传。
+     *
+     * 占位符可能被上游切在两个 chunk 之间，所以按字段各维护一个 [PrivacyRedactor.StreamingRestorer]：
+     * 它会把「可能是占位符前缀」的尾巴先扣住，下次连同后续内容一起交回；流结束时由调用方 flush。
+     */
+    private fun restoreStreamLine(
+        line: String,
+        session: dev.aigw.core.security.PrivacyRedactor.Session,
+        restorers: MutableMap<String, dev.aigw.core.security.PrivacyRedactor.StreamingRestorer>,
+    ): String {
+        if (!line.startsWith("data:")) return line
+        val payload = line.removePrefix("data:").trim()
+        if (payload.isEmpty() || payload == "[DONE]") return line
+        val obj = runCatching { JsonParser.parseString(payload).asJsonObject }.getOrNull() ?: return line
+        var changed = false
+        obj.arrayOrNull("choices")?.forEach { element ->
+            val delta = element.asObjectOrNull()?.objOrNull("delta") ?: return@forEach
+            for (key in STREAM_TEXT_FIELDS) {
+                val text = delta.stringOrNull(key) ?: continue
+                val restorer = restorers.getOrPut(key) { engine.privacyRedactor.restorerFor(session) }
+                val restored = restorer.feed(text)
+                if (restored != text) {
+                    delta.addProperty(key, restored)
+                    changed = true
+                }
+            }
+        }
+        return if (changed) "data: " + obj.toString() else line
     }
 
     /** 非流式：provider 已聚合完毕，直接返回其 completion。 */
@@ -1565,13 +1687,22 @@ class GatewayHttpServer(
         requestBody: String,
         httpStatus: Int,
         meta: CallMeta = CallMeta(),
+        privacySession: dev.aigw.core.security.PrivacyRedactor.Session = dev.aigw.core.security.PrivacyRedactor.Session.EMPTY,
+        anthropicInbound: Boolean = false,
     ): NanoHTTPD.Response {
         val payload = runCatching { JsonParser.parseString(aggregated).asJsonObject }.getOrNull()
         // 对调用方透明：将响应中的 model 归一化为客户端请求的逻辑模型
         if (payload != null && model.isNotEmpty()) {
             payload.addProperty("model", model)
         }
-        val normalized = payload?.toString() ?: aggregated
+        // 把上游看到的占位符换回原文（对客户端透明：它没脱敏，也不该看到占位符）
+        val restored = privacySession.restore(payload?.toString() ?: aggregated)
+        // Anthropic 入口：把 OpenAI 响应翻回 Anthropic 的 message 形状（要在还原之后做）
+        val normalized = if (anthropicInbound) {
+            dev.aigw.core.protocol.AnthropicMessages.toAnthropicResponse(restored, model)
+        } else {
+            restored
+        }
         val usage = payload?.objOrNull("usage")
         val content = payload?.arrayOrNull("choices")?.firstOrNull()
             ?.takeIf { it.isJsonObject }?.asJsonObject
@@ -1750,6 +1881,69 @@ class GatewayHttpServer(
     }
 
     /**
+     * `GET /metrics`：Prometheus 文本格式的运行时指标。
+     *
+     * 为什么单独做而不是把 JSON 交给 exporter 转：手机上跑不了 exporter 进程，
+     * 外部监控（Prometheus / Grafana Agent）能直接 scrape 这个端点就够了。
+     *
+     * 只暴露聚合数值（队列、请求量、token、成本），不带账号昵称与凭证。
+     */
+    private fun metrics(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (!isLocalhost(session) && !authorized(session)) return unauthorized(session)
+        val now = System.currentTimeMillis()
+        val today = engine.callLogStore.todayStats(now)
+        val total = engine.callLogStore.totalStats()
+        val (executing, queued) = queueSnapshot()
+
+        val sb = StringBuilder(2048)
+        fun metric(name: String, type: String, help: String, value: Number) {
+            sb.append("# HELP ").append(name).append(' ').append(help).append('\n')
+            sb.append("# TYPE ").append(name).append(' ').append(type).append('\n')
+            sb.append(name).append(' ').append(value).append('\n')
+        }
+
+        metric("aigw_http_requests_in_flight", "gauge", "正在处理的 HTTP 请求数", executing)
+        metric("aigw_http_requests_queued", "gauge", "已排队等待的 HTTP 请求数", queued)
+        metric("aigw_requests_today", "gauge", "今日调用次数", today.requests)
+        metric("aigw_requests_success_today", "gauge", "今日成功调用数", today.success)
+        metric("aigw_requests_failed_today", "gauge", "今日失败调用数", today.failed)
+        metric("aigw_requests_total", "gauge", "累计调用次数", total.requests)
+        metric("aigw_tokens_prompt_today", "gauge", "今日输入 token", today.promptTokens)
+        metric("aigw_tokens_completion_today", "gauge", "今日输出 token", today.completionTokens)
+        metric("aigw_tokens_cached_today", "gauge", "今日命中前缀缓存的 token", today.cachedTokens)
+        metric("aigw_cost_usd_today", "gauge", "今日估算成本（美元）", today.costMicros / 1_000_000.0)
+
+        // 存储落盘指标：排障「为什么变慢」时先看这两项。pending 持续不为 0 说明写入速度
+        // 跟不上产生速度；flush 耗时随存储体量线性增长则说明单文件全量重写的成本已经压不住了。
+        engine.storeFlushStats()?.let { flush ->
+            metric("aigw_store_pending_writes", "gauge", "尚未落盘的待提交写入数", flush.pendingWrites)
+            metric("aigw_store_flushes_total", "counter", "累计落盘提交次数", flush.flushes)
+            metric("aigw_store_flush_failures_total", "counter", "落盘失败累计次数", flush.failures)
+            metric("aigw_store_last_flush_keys", "gauge", "最近一次提交写入的键数", flush.lastBatchKeys)
+            metric("aigw_store_last_flush_ms", "gauge", "最近一次提交耗时（毫秒）", flush.lastFlushMillis)
+        }
+
+        // 供应商级指标：账号数与熔断状态，排障时最常看的两个维度
+        sb.append("# HELP aigw_provider_accounts 各供应商的账号总数\n")
+        sb.append("# TYPE aigw_provider_accounts gauge\n")
+        sb.append("# HELP aigw_provider_usable_accounts 各供应商可用账号数\n")
+        sb.append("# TYPE aigw_provider_usable_accounts gauge\n")
+        for (provider in engine.registry.all()) {
+            val summary = engine.pool.summary(provider.id)
+            sb.append("aigw_provider_accounts{provider=\"").append(provider.id).append("\"} ")
+                .append(summary.total).append('\n')
+            sb.append("aigw_provider_usable_accounts{provider=\"").append(provider.id).append("\"} ")
+                .append(summary.usable).append('\n')
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(
+            SimpleStatus(200, "OK"),
+            "text/plain; version=0.0.4; charset=utf-8",
+            sb.toString(),
+        )
+    }
+
+    /**
      * `GET /v1/health`：近期健康快照（供应商 × 模型）。
      *
      * 与 `/v1/credits` 同权限：只给本机看，不往局域网暴露。数据全在内存里，重启即清零。
@@ -1758,6 +1952,16 @@ class GatewayHttpServer(
         if (!isLocalhost(session) && !authorized(session)) return unauthorized(session)
         val root = JsonObject()
         root.addProperty("queue", "${queueSnapshot().first} 在途 / ${queueSnapshot().second} 排队")
+        // 落盘状态：并发变慢时先看这两项，pending 持续不为 0 或提交耗时暴涨就是存储堵了，
+        // 而不是上游慢。
+        engine.storeFlushStats()?.let { flush ->
+            root.addProperty(
+                "store",
+                "待提交 ${flush.pendingWrites} 写 / ${flush.pendingDeletes} 删，" +
+                    "已提交 ${flush.flushes} 次（失败 ${flush.failures}），" +
+                    "最近一次 ${flush.lastBatchKeys} 键 / ${flush.lastFlushMillis}ms",
+            )
+        }
         val window = JsonObject()
         engine.healthWindowOf().snapshot().forEach { (key, summary) ->
             val obj = JsonObject()
@@ -1793,9 +1997,20 @@ class GatewayHttpServer(
 
     // ------------------------------------------------------------------ 工具
 
-    private fun isLocalhost(session: NanoHTTPD.IHTTPSession): Boolean {
-        val remoteIp = session.remoteIpAddress ?: ""
-        return remoteIp == "127.0.0.1" || remoteIp == "::1" || remoteIp == "localhost"
+    private fun isLocalhost(session: NanoHTTPD.IHTTPSession): Boolean = isLoopbackAddress(session.remoteIpAddress)
+
+    private fun isLoopbackAddress(remoteIp: String?): Boolean =
+        remoteIp == "127.0.0.1" || remoteIp == "::1" || remoteIp == "localhost"
+
+    /**
+     * 「无 Key 调用」是否对该请求生效。
+     *
+     * 本机总是生效；局域网暴露时只对本机生效——否则同网段任何设备（含任意网页）
+     * 都能直接刷你的额度。抽成纯函数是为了能直接测这几行判定，不必伪造来源 IP。
+     */
+    internal fun noKeyAllowedFor(remoteIp: String?, exposeLan: Boolean, allowNoKey: Boolean): Boolean {
+        if (!allowNoKey) return false
+        return isLoopbackAddress(remoteIp) || !exposeLan
     }
 
     private fun authorized(session: NanoHTTPD.IHTTPSession): Boolean = checkAuth(session).ok
@@ -1811,7 +2026,8 @@ class GatewayHttpServer(
     private fun checkAuth(session: NanoHTTPD.IHTTPSession): AuthResult {
         // 本地回环地址发起额度/探活/可观测查询免 Key，方便本地 Dashboard 面板脚本在非对话时也能常驻刷新
         val uri = session.uri.trimEnd('/').ifEmpty { "/" }
-        if (isLocalhost(session) && uri in LOCAL_FREE_PATHS) return AuthResult(true)
+        val local = isLocalhost(session)
+        if (local && uri in LOCAL_FREE_PATHS) return AuthResult(true)
         val settings = engine.settings()
         val token = tokenOf(session)
 
@@ -1820,7 +2036,11 @@ class GatewayHttpServer(
             engine.clientKeyStore.authenticate(token)?.let { return AuthResult(true, it) }
         }
 
-        if (settings.allowNoKey) return AuthResult(true)
+        // 局域网暴露时「无 Key 调用」只对本机生效：否则同网段任何设备都能直接用你的额度。
+        // 本机行为不变（不至于升级后自己的面板脚本/客户端突然连不上）。
+        if (noKeyAllowedFor(session.remoteIpAddress, settings.exposeLan, settings.allowNoKey)) {
+            return AuthResult(true)
+        }
         val expected = settings.apiKey
         if (expected.isEmpty() || token == null) return AuthResult(false)
         val same = MessageDigest.isEqual(
@@ -1830,14 +2050,17 @@ class GatewayHttpServer(
         return AuthResult(same)
     }
 
-    /** 从三种携带方式里取令牌（Bearer / 裸 Authorization / x-goog-api-key / ?key=）。 */
+    /** 从多种携带方式里取令牌（Bearer / 裸 Authorization / x-api-key / x-goog-api-key / ?key=）。 */
     private fun tokenOf(session: NanoHTTPD.IHTTPSession): String? {
         val authHeader = session.headers["authorization"]
         val googKeyHeader = session.headers["x-goog-api-key"]
+        // Anthropic 系客户端（Claude Code 等）只发 x-api-key，不认 Authorization
+        val anthropicKeyHeader = session.headers["x-api-key"]
         val queryKey = session.parms["key"]
         return when {
             authHeader != null && authHeader.startsWith("Bearer ", ignoreCase = true) -> authHeader.substring(7).trim()
             authHeader != null -> authHeader.trim()
+            anthropicKeyHeader != null -> anthropicKeyHeader.trim()
             googKeyHeader != null -> googKeyHeader.trim()
             queryKey != null -> queryKey.trim()
             else -> null
@@ -1847,10 +2070,11 @@ class GatewayHttpServer(
     private fun unauthorized(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
         drainBody(session)
         val settings = engine.settings()
-        val message = if (settings.apiKey.isEmpty()) {
-            "网关已关闭「无 Key 调用」但尚未设置 API Key，请先在 App 里设置"
-        } else {
-            "缺少或错误的 API Key"
+        val message = when {
+            settings.apiKey.isEmpty() && settings.exposeLan ->
+                "已开启局域网监听，局域网访问必须带 Key；请先在 App 里设置 API Key"
+            settings.apiKey.isEmpty() -> "网关已关闭「无 Key 调用」但尚未设置 API Key，请先在 App 里设置"
+            else -> "缺少或错误的 API Key"
         }
         return errorResponse(401, "invalid_api_key", message)
     }
@@ -1953,8 +2177,12 @@ class GatewayHttpServer(
             .mapNotNull { key -> session.headers[key]?.let { "$key=$it" } }
             .joinToString(" ")
         log("请求体异常（$reason）：$headers 已收 ${body.length} 字符，前 256 字节=${body.take(256).escapeControl()}")
-        engine.logVerbose("请求原文（$reason）", body)
+        engine.logVerbose("请求原文（$reason）", redactForLog(body))
     }
+
+    /** 落盘前脱敏：详细日志里的请求原文同样不能留下明文密钥。 */
+    private fun redactForLog(text: String): String =
+        if (engine.securitySettings().privacyRedactionEnabled) engine.privacyRedactor.redactPlainText(text) else text
 
     private fun String.escapeControl(): String = buildString {
         for (ch in this@escapeControl) {
@@ -2177,11 +2405,15 @@ class GatewayHttpServer(
         /** `/authorize` 回调固定归 Trae（其它供应商的登录不经过网关端口）。 */
         const val TRAE_PROVIDER_ID = "trae"
 
-        /** 本机回环免 Key 的只读端点：都是面板类查询，不涉及对话。 */
+        /** 本机回环免 Key 的只读端点：都是面板类查询与监控拉取，不涉及对话。 */
         private val LOCAL_FREE_PATHS = setOf(
             "/v1/credits", "/credits", "/v1/v1/credits", "/healthz",
             "/v1/health", "/v1/route", "/v1/usage", "/v1/usage/requests", "/v1/limit",
+            "/metrics",
         )
+
+        /** 流式响应里需要还原占位符的文本字段（按字段各维护一个还原器）。 */
+        private val STREAM_TEXT_FIELDS = listOf("content", "reasoning_content")
     }
 }
 

@@ -18,6 +18,7 @@ import dev.aigw.app.data.ApkInstaller
 import dev.aigw.app.data.KeepAlive
 import dev.aigw.app.data.KeepAliveStatus
 import dev.aigw.app.gatewayEngine
+import dev.aigw.app.updateApkDir
 import dev.aigw.app.ui.theme.ThemeMode
 import dev.aigw.app.ui.theme.defaultAppColors
 import dev.aigw.app.ui.theme.formatHex
@@ -60,6 +61,7 @@ import dev.aigw.core.update.UpdateRepository
 import dev.aigw.core.update.UpdateSources
 import dev.aigw.core.usage.CallRecord
 import dev.aigw.core.usage.LogLine
+import dev.aigw.core.usage.StorageAudit
 import dev.aigw.core.usage.StorageReport
 import dev.aigw.core.usage.UsageStats
 import kotlinx.coroutines.Dispatchers
@@ -331,6 +333,8 @@ data class AppUiState(
     val failover: dev.aigw.core.failover.ModelFailoverSettings = dev.aigw.core.failover.ModelFailoverSettings(),
     /** 出网取证记录列表。 */
     val evidences: List<dev.aigw.core.security.OutboundEvidence> = emptyList(),
+    /** 风控提示词替换的命中记录。 */
+    val promptRewriteEvidences: List<dev.aigw.core.security.PromptRewriteEvidence> = emptyList(),
     val busy: String = "",
     val notice: String = "",
     /** 批量动作进行中的进度；非空时 UI 显示「已完成 X/N（当前：某账号）」。 */
@@ -392,6 +396,8 @@ private class Snapshot(
     val keepAlive: KeepAliveStatus,
     val security: dev.aigw.core.security.SecuritySettings,
     val evidences: List<dev.aigw.core.security.OutboundEvidence>,
+    /** 风控提示词替换的命中记录。 */
+    val promptRewriteEvidences: List<dev.aigw.core.security.PromptRewriteEvidence> = emptyList(),
     val modelExposure: dev.aigw.core.gateway.ModelExposureSettings,
     val failover: dev.aigw.core.failover.ModelFailoverSettings,
     val overlayKeepAlive: Boolean,
@@ -544,6 +550,7 @@ class AppViewModel(
                     keepAlive = KeepAlive.status(app),
                     security = engine.securitySettings(),
                     evidences = engine.sanitizer.evidenceList(),
+                    promptRewriteEvidences = engine.promptRewriter.evidenceList(),
                     modelExposure = engine.modelExposureSettings(),
                     failover = engine.failoverSettings(),
                     overlayKeepAlive = dev.aigw.app.data.KeepAlivePrefs.overlayEnabled(engine.store()),
@@ -577,6 +584,7 @@ class AppViewModel(
                 keepAlive = snapshot.keepAlive,
                 security = snapshot.security,
                 evidences = snapshot.evidences,
+                promptRewriteEvidences = snapshot.promptRewriteEvidences,
                 modelExposure = snapshot.modelExposure,
                 failover = snapshot.failover,
                 overlayKeepAlive = snapshot.overlayKeepAlive,
@@ -630,6 +638,16 @@ class AppViewModel(
             }
             _state.value = _state.value.copy(storage = report, storedCalls = count)
         }
+    }
+
+    /**
+     * 清理缓存类占用（更新包、崩溃日志、完整原文溢出），保留调用记录与用量。
+     *
+     * 这是「空间吃紧但不想丢历史」时的默认动作：删掉的只是能从记录重新生成或无关紧要的副本。
+     */
+    fun clearCaches() = action(alsoRefreshStorage = true) {
+        val (bytes, files) = engine.clearCaches()
+        if (files == 0L) "没有可清理的缓存" else "已清理 ${StorageAudit.formatSize(bytes)}（$files 个文件）"
     }
 
     fun refreshModels(silent: Boolean = false, forceRefresh: Boolean = false) {
@@ -1016,6 +1034,88 @@ class AppViewModel(
     fun clearEvidences() {
         engine.sanitizer.clearEvidence()
         _state.value = _state.value.copy(evidences = emptyList())
+    }
+
+    /** 清空风控提示词替换的命中记录。 */
+    fun clearPromptRewriteEvidences() {
+        engine.promptRewriter.clearEvidence()
+        _state.value = _state.value.copy(promptRewriteEvidences = emptyList())
+    }
+
+    /** 开关某个内置替换预设。 */
+    fun togglePromptRewritePreset(setName: String) {
+        val current = engine.securitySettings().effectivePromptPresets()
+        val next = if (setName in current) current - setName else current + setName
+        // 存全量列表：空列表会被当成「未配置」而回落到全部开启，所以必须先落成显式集合。
+        updateSecuritySettings(engine.securitySettings().copy(promptRewritePresets = next.toList()))
+    }
+
+    /** 新增一条自定义替换规则。 */
+    fun addPromptRewriteRule(name: String, pattern: String, replacement: String) {
+        val trimmed = pattern.trim()
+        if (trimmed.isEmpty()) {
+            notice("匹配文本不能为空")
+            return
+        }
+        val settings = engine.securitySettings()
+        val rule = dev.aigw.core.security.PromptRule(
+            name = name.trim().ifEmpty { "自定义/${trimmed.take(24)}" },
+            pattern = trimmed,
+            replacement = replacement,
+        )
+        updateSecuritySettings(settings.copy(promptRewriteRules = settings.promptRewriteRules + rule))
+    }
+
+    /** 删除一条自定义替换规则。 */
+    fun removePromptRewriteRule(rule: dev.aigw.core.security.PromptRule) {
+        val settings = engine.securitySettings()
+        updateSecuritySettings(settings.copy(promptRewriteRules = settings.promptRewriteRules - rule))
+    }
+
+    /** 禁用一条内置替换规则（内置规则写死在代码里，用禁用列表实现「删除」）。 */
+    fun disableBuiltinPromptRule(ruleName: String) {
+        val settings = engine.securitySettings()
+        if (settings.isBuiltinRuleDisabled(ruleName)) return
+        updateSecuritySettings(
+            settings.copy(promptRewriteDisabledRules = settings.promptRewriteDisabledRules + ruleName),
+        )
+    }
+
+    /** 恢复一条被禁用的内置规则。 */
+    fun enableBuiltinPromptRule(ruleName: String) {
+        val settings = engine.securitySettings()
+        updateSecuritySettings(
+            settings.copy(promptRewriteDisabledRules = settings.promptRewriteDisabledRules - ruleName),
+        )
+    }
+
+    /** 恢复全部被禁用的内置规则。 */
+    fun enableAllBuiltinPromptRules() {
+        val settings = engine.securitySettings()
+        if (settings.promptRewriteDisabledRules.isEmpty()) return
+        updateSecuritySettings(settings.copy(promptRewriteDisabledRules = emptyList()))
+    }
+
+    /** 导出全部自定义规则（JSON 文本），供用户存成文件或分享。 */
+    fun exportPromptRewriteRules(): String =
+        dev.aigw.core.security.PromptRiskRewriter.encodeRules(engine.securitySettings().promptRewriteRules)
+
+    /**
+     * 导入规则。同名（name）的覆盖，其余追加，所以重复导入同一份文件不会堆出重复规则。
+     *
+     * @return 导入的条数；解析失败返回 -1。
+     */
+    fun importPromptRewriteRules(raw: String): Int {
+        val parsed = dev.aigw.core.security.PromptRiskRewriter.decodeRules(raw)
+            ?: return -1
+        if (parsed.isEmpty()) return 0
+        val settings = engine.securitySettings()
+        val existing = settings.promptRewriteRules.associateBy { it.name }
+        val merged = LinkedHashMap<String, dev.aigw.core.security.PromptRule>()
+        for ((name, rule) in existing) merged[name] = rule
+        for (rule in parsed) merged[rule.name] = rule
+        updateSecuritySettings(settings.copy(promptRewriteRules = merged.values.toList()))
+        return parsed.size
     }
 
     fun setDynamicColor(enabled: Boolean) {
@@ -1879,8 +1979,15 @@ class AppViewModel(
         }
         cancelRequested = false
         _state.value = _state.value.copy(updateDownload = UpdateDownload.Probing)
-        val target = File(File(app.cacheDir, "updates").apply { mkdirs() }, "update-${info.version}.apk")
+        val target = File(app.updateApkDir().apply { mkdirs() }, "update-${info.version}.apk")
         updateJob = viewModelScope.launch {
+            // 下载前先清掉旧包：每次升级都留一份 APK，几轮下来就是几十 MB。
+            // 放在 IO 线程做，避免目录很大时卡主线程。
+            withContext(Dispatchers.IO) {
+                app.updateApkDir().listFiles()?.forEach { old ->
+                    if (old.isFile && old.absolutePath != target.absolutePath) old.delete()
+                }
+            }
             // 线路按实测带宽降序；全部探测失败时退回内置顺序逐一尝试
             val candidates = withContext(Dispatchers.IO) {
                 MirrorSpeedTest().measure(apkUrl, UpdateSources.DOWNLOAD)

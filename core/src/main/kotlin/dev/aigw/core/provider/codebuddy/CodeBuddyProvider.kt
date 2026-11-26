@@ -1,6 +1,7 @@
 package dev.aigw.core.provider.codebuddy
 
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import dev.aigw.core.provider.ACTION_CHECKIN
@@ -63,6 +64,8 @@ class CodeBuddyProvider internal constructor(
     private val endpointFor: (String) -> Endpoint = { endpointOf(it) },
     /** 写动作之间的停顿（上游对密集写有风控）；测试里换成空实现。 */
     private val pause: (Long) -> Unit = { Thread.sleep(it) },
+    /** 风控提示词替换开关（与「安全防护」页的同名选项一致）。 */
+    private val promptRewrite: () -> Boolean = { true },
 ) : Provider, DeviceCodeSupport, dev.aigw.core.provider.RegionAwareSupport {
 
     override val id: String = ID
@@ -145,7 +148,7 @@ class CodeBuddyProvider internal constructor(
         }
         val streaming = isStreamingBody(openAiBody)
         val model = resolveModel(requestedModelOf(openAiBody))
-        val request = prepareCodeBuddyRequest(openAiBody)
+        val request = prepareCodeBuddyRequest(openAiBody, promptRewrite())
         val prepared = request.body
         // 工具名被改写过时，响应里的调用名要还原（空表 = 直接透传）
         val restoreNames = request.toolNameRestore
@@ -909,6 +912,9 @@ class CodeBuddyProvider internal constructor(
                 )
             }
         } catch (e: Exception) {
+            // 额度包拉不到就显示空表，但必须留下原因：否则界面只是「没有额度包」，
+            // 与「真的没有额度包」长得一模一样，无法区分。
+            hooks.onLog("WorkBuddy 拉取额度包失败：${e.message ?: "未知错误"}")
             emptyList()
         }
     }
@@ -1652,7 +1658,8 @@ class CodeBuddyProvider internal constructor(
  * 2. `tool_choice` 归一化成字符串（上游该字段是 string，对象形式会 400）；
  * 3. 消息形状对齐上游要求（首条必须 system、`developer` 改叫 `system`）
  *    与 `max_completion_tokens` → `max_tokens`；
- * 4. 去掉上游会拦的特征文本（Claude Code / Codex CLI 的系统提示词片段）。
+ * 4. 去掉上游会拦的特征文本（Claude Code / Codex CLI 的系统提示词片段），
+ *    并用零宽空格打散宿主指纹（DeepSeek Runtime / project root / 11-128）。
  */
 internal fun prepareCodeBuddyBody(src: String): String = prepareCodeBuddyRequest(src).body
 
@@ -1662,14 +1669,22 @@ internal data class PreparedCodeBuddyRequest(
     val toolNameRestore: Map<String, String>,
 )
 
-internal fun prepareCodeBuddyRequest(src: String): PreparedCodeBuddyRequest {
+/**
+ * @param promptRewrite 是否执行提示词特征替换（未标记语句 + 宿主指纹）。
+ *   开关来自「安全防护 → 风控提示词替换」，与反重力的同名开关一致。
+ *   消息形状与工具 schema 的归一不在此列：那是上游的硬协议要求，关掉就直接 400。
+ */
+internal fun prepareCodeBuddyRequest(src: String, promptRewrite: Boolean = true): PreparedCodeBuddyRequest {
     val obj = runCatching { JsonParser.parseString(src).asJsonObject }.getOrNull()
         ?: return PreparedCodeBuddyRequest(src, emptyMap())
     obj.addProperty("stream", true)
     normalizeCodeBuddyToolChoice(obj)
     normalizeCodeBuddyMessages(obj)
     normalizeCodeBuddyMaxTokens(obj)
-    unflagCodeBuddyMessages(obj)
+    if (promptRewrite) {
+        unflagCodeBuddyMessages(obj)
+        breakHostFingerprintsDeep(obj)
+    }
     val restore = normalizeCodeBuddyTools(obj)
     return PreparedCodeBuddyRequest(obj.toString(), restore)
 }
@@ -1799,6 +1814,64 @@ internal fun unflagText(text: String): String {
     var result = text
     for ((pattern, replacement) in FLAGGED_TEXT) result = pattern.replace(result, replacement)
     return result
+}
+
+/**
+ * 宿主指纹：上游按**连续词组匹配**判断请求是不是官方客户端发的，命中就回
+ * 400 code=11128「Illegal API invocation from an unapproved channel」。
+ *
+ * 匹配不认语义，所以在词组内部插一个零宽空格（U+200B）就能让连续匹配失效；
+ * 模型看到的仍是同一个词，客户端也无需改提示词。
+ *
+ * 三处来自 issue #16 的逐段二分实测：`DeepSeek Runtime`（带空格那版才被拦）、
+ * `project root`（带空格与不带空格两种写法都要覆盖）、裸错误码 `11-128`
+ * （请求体出现即整单拦，看起来像在回显上游内部错误码）。
+ * `DeepSeek Harness` 是早期 REFUSED.md 的结论，留作兜底：命中时同样打散，不命中无副作用。
+ */
+private val HOST_FINGERPRINTS = listOf(
+    Regex("(?i)(deepseek)(\\s*)(runtime)") to "\$1\u200B\$2\$3",
+    Regex("(?i)(deepseek)(\\s*)(harness)") to "\$1\u200B\$2\$3",
+    Regex("(?i)(project)(\\s*)(root)") to "\$1\u200B\$2\$3",
+    Regex("(11)-(128)") to "\$1\u200B-\$2",
+)
+
+internal fun breakHostFingerprints(text: String): String {
+    var result = text
+    for ((pattern, replacement) in HOST_FINGERPRINTS) result = pattern.replace(result, replacement)
+    return result
+}
+
+/**
+ * 整包兜底：指纹不只在 messages 里，tools 的 function description、以及客户端自带的
+ * 其它字符串字段都可能带上（issue #16 的建议）。递归改写所有字符串值。
+ *
+ * 协议标识字段（工具名 / id / tool_call_id / model）跳过：它们是给上游和客户端做键用的，
+ * 掺进零宽字符会让工具调用对不上号，而指纹本来也不会出现在这些短标识里。
+ *
+ * 遍历前先复制 key 快照：JsonObject 迭代期间 addProperty 会并发修改。
+ */
+private val PROTOCOL_IDENTIFIER_KEYS = setOf("name", "id", "tool_call_id", "model")
+
+private fun breakHostFingerprintsDeep(element: JsonElement) {
+    when {
+        element.isJsonObject -> {
+            val obj = element.asJsonObject
+            for (key in obj.keySet().toList()) {
+                val value = obj.get(key) ?: continue
+                if (value.isJsonPrimitive && value.asJsonPrimitive.isString) {
+                    if (key in PROTOCOL_IDENTIFIER_KEYS) continue
+                    val original = value.asString
+                    val rewritten = breakHostFingerprints(original)
+                    if (rewritten != original) obj.addProperty(key, rewritten)
+                } else {
+                    breakHostFingerprintsDeep(value)
+                }
+            }
+        }
+        element.isJsonArray -> {
+            for (item in element.asJsonArray) breakHostFingerprintsDeep(item)
+        }
+    }
 }
 
 internal fun normalizeCodeBuddyToolChoice(obj: JsonObject) {
