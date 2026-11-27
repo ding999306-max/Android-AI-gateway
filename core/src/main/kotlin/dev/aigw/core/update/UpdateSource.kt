@@ -54,6 +54,7 @@ data class ReleaseInfo(
     /** APK 的 GitHub 原始下载地址；没有匹配资产时为 null。 */
     val apkUrl: String?,
     val apkSize: Long,
+    val publishedAt: String = "",
 ) {
     /** 与 [local] 逐段比较；远端更大返回 true。 */
     fun isNewerThan(local: String): Boolean = isNewerVersion(version, local)
@@ -85,7 +86,7 @@ fun isNewerVersion(remote: String, local: String): Boolean {
  */
 object UpdateRepository {
 
-    private const val API = "https://api.github.com/repos/ding999306-max/Android-AI-gateway/releases/latest"
+    private const val API = "https://api.github.com/repos/ding999306-max/Android-AI-gateway"
     private const val UA = "ai-gateway-android"
 
     fun fetchLatest(
@@ -93,16 +94,53 @@ object UpdateRepository {
         connectTimeoutMs: Int = 8_000,
         readTimeoutMs: Int = 15_000,
     ): ReleaseInfo {
+        return fetchMetadata("/releases/latest", sources, connectTimeoutMs, readTimeoutMs, ::parse)
+    }
+
+    /** 仅把同步作业明确报告的合并冲突展示给用户，忽略早于已发布版本的失败。 */
+    fun fetchSyncConflict(release: ReleaseInfo): String? = fetchSyncConflict(release) { path ->
+        fetchMetadata(path, parser = { it })
+    }
+
+    internal fun fetchSyncConflict(release: ReleaseInfo, loadMetadata: (String) -> String): String? {
+        val runs = JsonParser.parseString(loadMetadata("/actions/workflows/upstream-sync.yml/runs?per_page=1"))
+            .asJsonObject.arrayOrNull("workflow_runs")?.firstOrNull()?.asJsonObject
+        if (runs == null || runs.str("conclusion") != "failure") return null
+        val publishedAt = runCatching { java.time.Instant.parse(release.publishedAt) }.getOrNull()
+        val failedAt = runCatching { java.time.Instant.parse(runs.str("updated_at")) }.getOrNull()
+        if (publishedAt == null || failedAt == null || !failedAt.isAfter(publishedAt)) return null
+        val runId = runs.str("id").toLongOrNull() ?: return null
+        val jobs = JsonParser.parseString(loadMetadata("/actions/runs/$runId/jobs?per_page=100"))
+            .asJsonObject.arrayOrNull("jobs")
+        val sync = jobs?.firstOrNull {
+            it.isJsonObject && it.asJsonObject.str("name") == "sync" &&
+                it.asJsonObject.str("conclusion") == "failure"
+        }?.asJsonObject ?: return null
+        val checkId = sync.str("id").toLongOrNull() ?: return null
+        val annotations = loadMetadata("/check-runs/$checkId/annotations?per_page=100")
+        val conflict = JsonParser.parseString(annotations).asJsonArray.any {
+            it.isJsonObject && it.asJsonObject.str("message").contains("与本地改动冲突，需要人工解决")
+        }
+        return if (conflict) "上游更新合并冲突，新版本暂未生成，请处理 GitHub 冲突后重新编译" else null
+    }
+
+    private fun <T> fetchMetadata(
+        path: String,
+        sources: List<MirrorSource> = UpdateSources.METADATA,
+        connectTimeoutMs: Int = 8_000,
+        readTimeoutMs: Int = 15_000,
+        parser: (String) -> T,
+    ): T {
         if (sources.isEmpty()) throw IllegalStateException("没有可用的更新线路")
         val pool = java.util.concurrent.Executors.newFixedThreadPool(sources.size) { r ->
             Thread(r, "update-meta").apply { isDaemon = true }
         }
         try {
             // 竞争取先到的那份 JSON：国内直连可能一直等到超时，而镜像早就返回了
-            val completion = java.util.concurrent.ExecutorCompletionService<ReleaseInfo>(pool)
+            val completion = java.util.concurrent.ExecutorCompletionService<T>(pool)
             sources.forEach { source ->
                 completion.submit(java.util.concurrent.Callable {
-                    parse(loadText(source, connectTimeoutMs, readTimeoutMs))
+                    parser(loadText(source, path, connectTimeoutMs, readTimeoutMs))
                 })
             }
             var lastError: Exception? = null
@@ -138,20 +176,22 @@ object UpdateRepository {
             notes = notes,
             apkUrl = pick?.str("browser_download_url")?.ifEmpty { null },
             apkSize = pick?.str("size")?.toLongOrNull() ?: 0L,
+            publishedAt = obj.str("published_at"),
         )
     }
 
-    private fun loadText(source: MirrorSource, connectTimeoutMs: Int, readTimeoutMs: Int): String {
+    private fun loadText(source: MirrorSource, path: String, connectTimeoutMs: Int, readTimeoutMs: Int): String {
         val connection = if (source.isDirect) {
-            (URL(source.map(API)).openConnection() as HttpURLConnection)
+            (URL(source.map(API + path)).openConnection() as HttpURLConnection)
         } else {
             // 镜像是国内入口，绕开用户为 GitHub 开的代理
-            (URL(source.map(API)).openConnection(Proxy.NO_PROXY) as HttpURLConnection)
+            (URL(source.map(API + path)).openConnection(Proxy.NO_PROXY) as HttpURLConnection)
         }
         val conn = connection.apply {
             requestMethod = "GET"
             connectTimeout = connectTimeoutMs
             readTimeout = readTimeoutMs
+            useCaches = false
             instanceFollowRedirects = true
             setRequestProperty("Accept", "application/vnd.github+json")
             setRequestProperty("User-Agent", UA)

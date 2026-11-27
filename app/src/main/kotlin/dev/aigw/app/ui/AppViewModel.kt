@@ -2101,14 +2101,31 @@ class AppViewModel(
         if (_state.value.updateChecking) return
         _state.value = _state.value.copy(updateChecking = true)
         viewModelScope.launch {
-            val outcome = withContext(Dispatchers.IO) { runCatching { fetchLatestRelease() } }
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching {
+                    val release = UpdateRepository.fetchLatest()
+                    val syncStatus = if (manual) runCatching { UpdateRepository.fetchSyncConflict(release) } else null
+                    val notice = syncStatus?.getOrElse { "GitHub 同步状态获取失败，请稍后重试" }
+                    release to notice
+                }
+            }
             // 自动检查无论成败都记一次「今天已检查」，保证每天最多一次
             if (!manual) updateStore.setLastCheckEpochDay(currentEpochDay())
             outcome.fold(
-                onSuccess = { info ->
+                onSuccess = { (release, syncNotice) ->
+                    val info = UpdateInfo(
+                        version = release.version,
+                        url = release.pageUrl,
+                        notes = release.notes,
+                        apkUrl = release.apkUrl,
+                        apkSize = release.apkSize,
+                    )
+                    if (manual && syncNotice != null) {
+                        _state.value = _state.value.copy(notice = syncNotice)
+                    }
                     if (dev.aigw.core.update.isNewerVersion(info.version, installedVersionName())) {
                         _state.value = _state.value.copy(updateInfo = info)
-                    } else if (manual) {
+                    } else if (manual && syncNotice == null) {
                         _state.value = _state.value.copy(notice = "已是最新版本（${installedVersionName()}）")
                     }
                 },
@@ -2120,18 +2137,6 @@ class AppViewModel(
             )
             _state.value = _state.value.copy(updateChecking = false)
         }
-    }
-
-    /** 直连 GitHub 取最新 Release（多线路竞争，不在主线程阻塞）。 */
-    private fun fetchLatestRelease(): UpdateInfo {
-        val release = UpdateRepository.fetchLatest()
-        return UpdateInfo(
-            version = release.version,
-            url = release.pageUrl,
-            notes = release.notes,
-            apkUrl = release.apkUrl,
-            apkSize = release.apkSize,
-        )
     }
 
     /** 当前安装的版本名。 */

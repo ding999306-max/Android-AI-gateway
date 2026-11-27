@@ -61,6 +61,45 @@ class UpdateRepositoryTest {
     }
 
     @Test
+    fun `同步合并冲突时提示用户`() {
+        assertTrue(checkSync("failure", "2026-11-26T01:00:00Z")!!.contains("合并冲突"))
+    }
+
+    @Test
+    fun `成功及运行中的同步不提示冲突`() {
+        assertEquals(null, checkSync("success", "2026-11-26T01:00:00Z"))
+        assertEquals(null, checkSync("", "2026-11-26T01:00:00Z"))
+    }
+
+    @Test
+    fun `发布新版后忽略历史冲突`() {
+        assertEquals(null, checkSync("failure", "2026-11-24T01:00:00Z"))
+        assertEquals(null, checkSync("failure", "2026-11-25T01:00:00Z"))
+    }
+
+    @Test
+    fun `普通失败不误报合并冲突`() {
+        assertEquals(null, checkSync("failure", "2026-11-26T01:00:00Z", "Process completed with exit code 1."))
+    }
+
+    private fun checkSync(
+        conclusion: String,
+        failedAt: String,
+        message: String = "上游 v2.39.0 与本地改动冲突，需要人工解决",
+    ): String? {
+        val release = UpdateRepository.parse(releaseJson).copy(publishedAt = "2026-11-25T01:00:00Z")
+        return UpdateRepository.fetchSyncConflict(release) { path ->
+            when {
+                path.contains("/workflows/") ->
+                    """{"workflow_runs":[{"id":100,"conclusion":"$conclusion","updated_at":"$failedAt"}]}"""
+                path.contains("/jobs") ->
+                    """{"jobs":[{"id":200,"name":"sync","conclusion":"failure"}]}"""
+                else -> """[{"message":"$message"}]"""
+            }
+        }
+    }
+
+    @Test
     fun `镜像改写只在前缀非空时生效`() {
         val url = "https://github.com/a/b.apk"
         assertEquals(url, UpdateSources.DOWNLOAD.first().map(url))
